@@ -123,6 +123,17 @@ const BASE64_IMAGE_PREFIX_REGEX = /^data:image\/[a-zA-Z0-9.+-]+;base64,/i
 const BASE64_IMAGE_URL_REGEX = /^data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/_=-]+$/i
 const LONG_BASE64_IMAGE_LENGTH = 1600
 
+function generateUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
 function isLongBase64ImageUrl(url: string): boolean {
   return BASE64_IMAGE_PREFIX_REGEX.test(url) && url.length >= LONG_BASE64_IMAGE_LENGTH
 }
@@ -840,7 +851,7 @@ function hydrateQuestions(input: unknown): Question[] {
 
       const item = rawItem as Record<string, unknown>
       const base = {
-        id: String(item.id ?? crypto.randomUUID()),
+        id: String(item.id ?? generateUuid()),
         subject: (item.subject as SubjectKey) ?? 'other',
         stem: String(item.stem ?? ''),
         createdAt: String(item.createdAt ?? new Date().toISOString()),
@@ -1441,7 +1452,7 @@ function App() {
     const originalQuestion = editPathQuestionId
       ? questions.find((item) => item.id === editPathQuestionId)
       : null
-    const questionId = originalQuestion?.id ?? crypto.randomUUID()
+    const questionId = originalQuestion?.id ?? generateUuid()
     const createdAt = originalQuestion?.createdAt ?? now
 
     if (draft.type === 'choice') {
