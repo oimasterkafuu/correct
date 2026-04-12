@@ -52,9 +52,10 @@ interface ParsedAiResponse {
 type ChatContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
 type ChatMessageContent = string | ChatContentPart[]
 
-const SETTINGS_KEY = 'mistakes.settings.v1'
 const QUESTIONS_KEY = 'mistakes.questions.v1'
 const LAST_CREATED_SUBJECT_KEY = 'mistakes.last-created-subject.v1'
+const AI_SETTINGS_CLOUD_URL = import.meta.env.VITE_AI_SETTINGS_URL?.trim() || '/api/ai-settings'
+const AI_SETTINGS_CLOUD_TOKEN = import.meta.env.VITE_AI_SETTINGS_TOKEN?.trim() || ''
 
 const INITIAL_AI_SETTINGS: AiSettings = {
   enabled: true,
@@ -345,6 +346,50 @@ function buildAIEndpoint(baseUrl: string): string {
     return trimmed
   }
   return `${trimmed}/chat/completions`
+}
+
+function parseAiSettingsFromPayload(payload: unknown): AiSettings | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const root = payload as Record<string, unknown>
+  const nestedSettings = root.settings
+  const nestedData = root.data
+  const candidate =
+    nestedSettings && typeof nestedSettings === 'object'
+      ? nestedSettings
+      : nestedData && typeof nestedData === 'object'
+        ? nestedData
+        : root
+
+  if (!candidate || typeof candidate !== 'object') {
+    return null
+  }
+
+  const source = candidate as Record<string, unknown>
+  const baseUrl = typeof source.baseUrl === 'string' ? source.baseUrl.trim() : ''
+  const apiKey = typeof source.apiKey === 'string' ? source.apiKey.trim() : ''
+  const model = typeof source.model === 'string' ? source.model.trim() : ''
+  const enabled = typeof source.enabled === 'boolean' ? source.enabled : true
+
+  return {
+    enabled,
+    baseUrl,
+    apiKey,
+    model,
+  }
+}
+
+function maskSecret(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return '未配置'
+  }
+  if (trimmed.length <= 8) {
+    return '********'
+  }
+  return `${trimmed.slice(0, 4)}${'*'.repeat(Math.max(4, trimmed.length - 8))}${trimmed.slice(-4)}`
 }
 
 function ensureLength(values: string[], count: number): string[] {
@@ -860,9 +905,10 @@ function App() {
   const location = useLocation()
   const navigate = useNavigate()
 
-  const [settings, setSettings] = useState<AiSettings>(() =>
-    fromLocalStorage(SETTINGS_KEY, INITIAL_AI_SETTINGS),
-  )
+  const [settings, setSettings] = useState<AiSettings>(INITIAL_AI_SETTINGS)
+  const [aiSettingsLoaded, setAiSettingsLoaded] = useState(false)
+  const [aiSettingsSyncing, setAiSettingsSyncing] = useState(false)
+  const [aiSettingsSyncedAt, setAiSettingsSyncedAt] = useState<string | null>(null)
   const [questions, setQuestions] = useState<Question[]>(() =>
     hydrateQuestions(fromLocalStorage(QUESTIONS_KEY, [])),
   )
@@ -971,12 +1017,57 @@ function App() {
     [resolveMarkdownForRender],
   )
 
+  const syncAiSettingsFromCloud = useCallback(
+    async (withSuccessNotice = false) => {
+      setAiSettingsSyncing(true)
+      try {
+        const headers: HeadersInit = {}
+        if (AI_SETTINGS_CLOUD_TOKEN) {
+          headers.Authorization = `Bearer ${AI_SETTINGS_CLOUD_TOKEN}`
+        }
+
+        const response = await fetch(AI_SETTINGS_CLOUD_URL, {
+          method: 'GET',
+          headers,
+        })
+        if (!response.ok) {
+          throw new Error(`云端配置拉取失败（HTTP ${response.status}）`)
+        }
+
+        const payload = (await response.json()) as unknown
+        const parsed = parseAiSettingsFromPayload(payload)
+        if (!parsed) {
+          throw new Error('云端配置格式错误，请检查接口返回。')
+        }
+
+        setSettings(parsed)
+        const syncedAt = new Date().toISOString()
+        setAiSettingsSyncedAt(syncedAt)
+        if (withSuccessNotice) {
+          setNotice('已从云端同步 AI 配置。')
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '云端配置拉取失败'
+        setNotice(message)
+      } finally {
+        setAiSettingsSyncing(false)
+        setAiSettingsLoaded(true)
+      }
+    },
+    [setNotice],
+  )
+
+  useEffect(() => {
+    void syncAiSettingsFromCloud(false)
+  }, [syncAiSettingsFromCloud])
+
   const pathname = location.pathname
   const pathnameLower = pathname.toLowerCase()
   const editPathQuestionId = parseEditQuestionIdFromPath(pathname)
   const isEditing = editPathQuestionId !== null
 
   const aiConfigured =
+    settings.enabled &&
     settings.baseUrl.trim().length > 0 &&
     settings.apiKey.trim().length > 0 &&
     settings.model.trim().length > 0
@@ -1028,14 +1119,14 @@ function App() {
   )
 
   useEffect(() => {
-    toLocalStorage(SETTINGS_KEY, settings)
-  }, [settings])
-
-  useEffect(() => {
     toLocalStorage(QUESTIONS_KEY, questions)
   }, [questions])
 
   useEffect(() => {
+    if (!aiSettingsLoaded) {
+      return
+    }
+
     if (!isKnownPath) {
       navigate(aiConfigured ? '/create' : '/settings', { replace: true })
       return
@@ -1049,7 +1140,7 @@ function App() {
     if (!aiConfigured && currentTab !== 'settings') {
       navigate('/settings', { replace: true })
     }
-  }, [aiConfigured, currentTab, isKnownPath, navigate, pathnameLower])
+  }, [aiConfigured, aiSettingsLoaded, currentTab, isKnownPath, navigate, pathnameLower])
 
   useEffect(() => {
     setMobileMenuOpen(false)
@@ -1435,7 +1526,7 @@ function App() {
 
   const generateAnalysisWithAI = async (target: AnalysisTarget) => {
     if (!aiConfigured) {
-      setNotice('请先在设置里配置 AI 功能。')
+      setNotice('请先在设置页同步云端 AI 配置。')
       return
     }
 
@@ -1876,7 +1967,9 @@ function App() {
 
           {!aiConfigured ? (
             <div className="alert">
-              请先在“设置”里填好 Base URL、API Key、模型名称，配置完成后才能使用其它功能。
+              {!aiSettingsLoaded || aiSettingsSyncing
+                ? '正在从云端同步 AI 配置，请稍候。'
+                : 'AI 云端配置当前不可用，请到“设置”页重新同步后再试。'}
             </div>
           ) : null}
 
@@ -1884,53 +1977,32 @@ function App() {
             <section className="pane">
               <header className="pane-head">
                 <h2>AI 设置</h2>
-                <p>先配置 AI，再开始录入和管理错题。</p>
+                <p>AI 配置由云端统一管理，本地不会保存或覆盖配置。</p>
               </header>
 
               <div className="settings-grid">
                 <label>
+                  云端配置地址
+                  <input type="text" value={AI_SETTINGS_CLOUD_URL} readOnly />
+                </label>
+
+                <label>
                   Base URL
                   <input
                     type="text"
-                    value={settings.baseUrl}
-                    placeholder="例如 https://api.openai.com/v1"
-                    onChange={(event) =>
-                      setSettings((prev) => ({
-                        ...prev,
-                        baseUrl: event.target.value,
-                      }))
-                    }
+                    value={settings.baseUrl || '未配置'}
+                    readOnly
                   />
                 </label>
 
                 <label>
                   API Key
-                  <input
-                    type="password"
-                    value={settings.apiKey}
-                    placeholder="sk-..."
-                    onChange={(event) =>
-                      setSettings((prev) => ({
-                        ...prev,
-                        apiKey: event.target.value,
-                      }))
-                    }
-                  />
+                  <input type="text" value={maskSecret(settings.apiKey)} readOnly />
                 </label>
 
                 <label>
                   模型名称
-                  <input
-                    type="text"
-                    value={settings.model}
-                    placeholder="例如 gpt-4o-mini 或其它兼容模型"
-                    onChange={(event) =>
-                      setSettings((prev) => ({
-                        ...prev,
-                        model: event.target.value,
-                      }))
-                    }
-                  />
+                  <input type="text" value={settings.model || '未配置'} readOnly />
                 </label>
               </div>
 
@@ -1938,12 +2010,17 @@ function App() {
                 <button
                   type="button"
                   className="primary-btn"
-                  onClick={() => setNotice(aiConfigured ? 'AI 设置已完成。' : '请补全 AI 配置项。')}
+                  onClick={() => void syncAiSettingsFromCloud(true)}
+                  disabled={aiSettingsSyncing}
                 >
-                  保存设置
+                  {aiSettingsSyncing ? '同步中...' : '重新同步云端配置'}
                 </button>
                 <p className={aiConfigured ? 'status-ok' : 'status-warn'}>
-                  当前状态：{aiConfigured ? '可用' : '不可用'}
+                  当前状态：
+                  {aiSettingsSyncing || !aiSettingsLoaded ? '同步中' : aiConfigured ? '可用' : '不可用'}
+                </p>
+                <p className="hint">
+                  最近同步：{aiSettingsSyncedAt ? formatDateTime(aiSettingsSyncedAt) : '尚未成功同步'}
                 </p>
               </div>
             </section>
