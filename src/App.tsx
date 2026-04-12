@@ -56,6 +56,8 @@ const QUESTIONS_KEY = 'mistakes.questions.v1'
 const LAST_CREATED_SUBJECT_KEY = 'mistakes.last-created-subject.v1'
 const AI_SETTINGS_CLOUD_URL = import.meta.env.VITE_AI_SETTINGS_URL?.trim() || '/api/ai-settings'
 const AI_SETTINGS_CLOUD_TOKEN = import.meta.env.VITE_AI_SETTINGS_TOKEN?.trim() || ''
+const AI_SETTINGS_CLOUD_SAVE_METHOD =
+  import.meta.env.VITE_AI_SETTINGS_SAVE_METHOD?.trim().toUpperCase() || 'PUT'
 
 const INITIAL_AI_SETTINGS: AiSettings = {
   enabled: true,
@@ -381,15 +383,49 @@ function parseAiSettingsFromPayload(payload: unknown): AiSettings | null {
   }
 }
 
-function maskSecret(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed) {
-    return '未配置'
+function getPayloadMessage(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
   }
-  if (trimmed.length <= 8) {
-    return '********'
+  const source = payload as Record<string, unknown>
+  const direct = source.message
+  if (typeof direct === 'string' && direct.trim().length > 0) {
+    return direct.trim()
   }
-  return `${trimmed.slice(0, 4)}${'*'.repeat(Math.max(4, trimmed.length - 8))}${trimmed.slice(-4)}`
+  const error = source.error
+  if (typeof error === 'string' && error.trim().length > 0) {
+    return error.trim()
+  }
+  if (error && typeof error === 'object') {
+    const nested = (error as Record<string, unknown>).message
+    if (typeof nested === 'string' && nested.trim().length > 0) {
+      return nested.trim()
+    }
+  }
+  return null
+}
+
+async function parseCloudResponseJson(response: Response): Promise<unknown | null> {
+  const raw = await response.text()
+  const text = raw.trim()
+  if (!text) {
+    return null
+  }
+
+  const contentType = (response.headers.get('content-type') || '').toLowerCase()
+  const isHtmlFallback =
+    contentType.includes('text/html') ||
+    /^<!doctype html>/i.test(text) ||
+    /^<html[\s>]/i.test(text)
+  if (isHtmlFallback) {
+    throw new Error('云端配置接口返回了 HTML 页面，请检查 `VITE_AI_SETTINGS_URL` 是否指向真实 API。')
+  }
+
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    throw new Error('云端配置接口返回了非 JSON 内容，请检查服务端返回格式。')
+  }
 }
 
 function ensureLength(values: string[], count: number): string[] {
@@ -908,6 +944,7 @@ function App() {
   const [settings, setSettings] = useState<AiSettings>(INITIAL_AI_SETTINGS)
   const [aiSettingsLoaded, setAiSettingsLoaded] = useState(false)
   const [aiSettingsSyncing, setAiSettingsSyncing] = useState(false)
+  const [aiSettingsSaving, setAiSettingsSaving] = useState(false)
   const [aiSettingsSyncedAt, setAiSettingsSyncedAt] = useState<string | null>(null)
   const [questions, setQuestions] = useState<Question[]>(() =>
     hydrateQuestions(fromLocalStorage(QUESTIONS_KEY, [])),
@@ -1018,7 +1055,7 @@ function App() {
   )
 
   const syncAiSettingsFromCloud = useCallback(
-    async (withSuccessNotice = false) => {
+    async (showSuccessNotice = false, showErrorNotice = true) => {
       setAiSettingsSyncing(true)
       try {
         const headers: HeadersInit = {}
@@ -1030,11 +1067,12 @@ function App() {
           method: 'GET',
           headers,
         })
+        const payload = await parseCloudResponseJson(response)
         if (!response.ok) {
-          throw new Error(`云端配置拉取失败（HTTP ${response.status}）`)
+          const detail = getPayloadMessage(payload)
+          throw new Error(detail || `云端配置拉取失败（HTTP ${response.status}）`)
         }
 
-        const payload = (await response.json()) as unknown
         const parsed = parseAiSettingsFromPayload(payload)
         if (!parsed) {
           throw new Error('云端配置格式错误，请检查接口返回。')
@@ -1043,22 +1081,68 @@ function App() {
         setSettings(parsed)
         const syncedAt = new Date().toISOString()
         setAiSettingsSyncedAt(syncedAt)
-        if (withSuccessNotice) {
+        if (showSuccessNotice) {
           setNotice('已从云端同步 AI 配置。')
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : '云端配置拉取失败'
-        setNotice(message)
+        if (showErrorNotice) {
+          const message = error instanceof Error ? error.message : '云端配置拉取失败'
+          setNotice(message)
+        }
       } finally {
         setAiSettingsSyncing(false)
         setAiSettingsLoaded(true)
       }
     },
-    [setNotice],
+    [],
   )
 
+  const saveAiSettingsToCloud = useCallback(async () => {
+    setAiSettingsSaving(true)
+    try {
+      const headers: HeadersInit = {
+        'Content-Type': 'application/json',
+      }
+      if (AI_SETTINGS_CLOUD_TOKEN) {
+        headers.Authorization = `Bearer ${AI_SETTINGS_CLOUD_TOKEN}`
+      }
+
+      const response = await fetch(AI_SETTINGS_CLOUD_URL, {
+        method: AI_SETTINGS_CLOUD_SAVE_METHOD,
+        headers,
+        body: JSON.stringify({
+          settings: {
+            enabled: settings.enabled,
+            baseUrl: settings.baseUrl.trim(),
+            apiKey: settings.apiKey.trim(),
+            model: settings.model.trim(),
+          },
+        }),
+      })
+
+      const payload = await parseCloudResponseJson(response)
+      if (!response.ok) {
+        const detail = getPayloadMessage(payload)
+        throw new Error(detail || `云端配置保存失败（HTTP ${response.status}）`)
+      }
+
+      const parsed = parseAiSettingsFromPayload(payload)
+      if (parsed) {
+        setSettings(parsed)
+      }
+      setAiSettingsSyncedAt(new Date().toISOString())
+      setNotice('AI 配置已保存到云端。')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '云端配置保存失败'
+      setNotice(message)
+    } finally {
+      setAiSettingsSaving(false)
+      setAiSettingsLoaded(true)
+    }
+  }, [settings])
+
   useEffect(() => {
-    void syncAiSettingsFromCloud(false)
+    void syncAiSettingsFromCloud(false, false)
   }, [syncAiSettingsFromCloud])
 
   const pathname = location.pathname
@@ -1067,7 +1151,6 @@ function App() {
   const isEditing = editPathQuestionId !== null
 
   const aiConfigured =
-    settings.enabled &&
     settings.baseUrl.trim().length > 0 &&
     settings.apiKey.trim().length > 0 &&
     settings.model.trim().length > 0
@@ -1536,10 +1619,10 @@ function App() {
       return
     }
 
-    let answerProvided = false
+    let answerProvided: boolean
     let shouldGenerateAnswers = false
-    let givenAnswerText = ''
-    let answerCount = 1
+    let givenAnswerText: string
+    let answerCount: number
 
     if (target === 'choice') {
       const selected = sanitizeChoiceAnswers(draft.choiceMode, draft.choiceAnswers, draft.optionCount)
@@ -1977,7 +2060,7 @@ function App() {
             <section className="pane">
               <header className="pane-head">
                 <h2>AI 设置</h2>
-                <p>AI 配置由云端统一管理，本地不会保存或覆盖配置。</p>
+                <p>可在客户端编辑并保存到云端，设备间通过云端配置同步。</p>
               </header>
 
               <div className="settings-grid">
@@ -1990,19 +2073,45 @@ function App() {
                   Base URL
                   <input
                     type="text"
-                    value={settings.baseUrl || '未配置'}
-                    readOnly
+                    value={settings.baseUrl}
+                    placeholder="例如 https://api.openai.com/v1"
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        baseUrl: event.target.value,
+                      }))
+                    }
                   />
                 </label>
 
                 <label>
                   API Key
-                  <input type="text" value={maskSecret(settings.apiKey)} readOnly />
+                  <input
+                    type="password"
+                    value={settings.apiKey}
+                    placeholder="sk-..."
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        apiKey: event.target.value,
+                      }))
+                    }
+                  />
                 </label>
 
                 <label>
                   模型名称
-                  <input type="text" value={settings.model || '未配置'} readOnly />
+                  <input
+                    type="text"
+                    value={settings.model}
+                    placeholder="例如 gpt-4o-mini 或其它兼容模型"
+                    onChange={(event) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        model: event.target.value,
+                      }))
+                    }
+                  />
                 </label>
               </div>
 
@@ -2010,14 +2119,30 @@ function App() {
                 <button
                   type="button"
                   className="primary-btn"
-                  onClick={() => void syncAiSettingsFromCloud(true)}
-                  disabled={aiSettingsSyncing}
+                  onClick={() => void saveAiSettingsToCloud()}
+                  disabled={aiSettingsSyncing || aiSettingsSaving}
                 >
-                  {aiSettingsSyncing ? '同步中...' : '重新同步云端配置'}
+                  {aiSettingsSaving ? '保存中...' : '保存到云端'}
+                </button>
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  onClick={() => void syncAiSettingsFromCloud(true)}
+                  disabled={aiSettingsSyncing || aiSettingsSaving}
+                >
+                  {aiSettingsSyncing ? '同步中...' : '从云端重新拉取'}
                 </button>
                 <p className={aiConfigured ? 'status-ok' : 'status-warn'}>
                   当前状态：
-                  {aiSettingsSyncing || !aiSettingsLoaded ? '同步中' : aiConfigured ? '可用' : '不可用'}
+                  {aiSettingsSyncing
+                    ? '同步中'
+                    : aiSettingsSaving
+                      ? '保存中'
+                      : !aiSettingsLoaded
+                        ? '初始化中'
+                        : aiConfigured
+                          ? '可用'
+                          : '不可用'}
                 </p>
                 <p className="hint">
                   最近同步：{aiSettingsSyncedAt ? formatDateTime(aiSettingsSyncedAt) : '尚未成功同步'}
