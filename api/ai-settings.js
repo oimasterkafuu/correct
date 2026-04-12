@@ -7,6 +7,8 @@ const DEFAULT_SETTINGS = {
 
 const KV_KEY = process.env.AI_SETTINGS_KV_KEY || 'correct:ai-settings:v1'
 
+const memoryFallback = new Map()
+
 function normalizeSettings(raw) {
   if (!raw || typeof raw !== 'object') {
     return { ...DEFAULT_SETTINGS }
@@ -50,6 +52,19 @@ async function callKv(pathname, method = 'GET') {
   const baseUrl = process.env.KV_REST_API_URL
   const token = process.env.KV_REST_API_TOKEN
   if (!baseUrl || !token) {
+    const getMatch = pathname.match(/^get\/(.+)$/)
+    if (getMatch) {
+      const key = decodeURIComponent(getMatch[1])
+      const value = memoryFallback.get(key) ?? null
+      return { result: value }
+    }
+    const setMatch = pathname.match(/^set\/([^/]+)\/(.+)$/)
+    if (setMatch) {
+      const key = decodeURIComponent(setMatch[1])
+      const value = decodeURIComponent(setMatch[2])
+      memoryFallback.set(key, value)
+      return { result: 'OK' }
+    }
     throw new Error('KV 未配置：请设置 KV_REST_API_URL 与 KV_REST_API_TOKEN。')
   }
 
