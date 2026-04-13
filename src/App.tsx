@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import katex from 'katex'
 import { useLocation, useNavigate } from 'react-router-dom'
+import ExportConfigModal from './components/ExportConfigModal'
 import MarkdownEditor from './components/MarkdownEditor'
 import MarkdownRenderer from './components/MarkdownRenderer'
 import { SUBJECT_MAP, SUBJECTS } from './data/subjects'
+import {
+  DEFAULT_PDF_EXPORT_SPACING_CONFIG,
+  loadPdfExportSpacingConfig,
+  savePdfExportSpacingConfig,
+  sanitizePdfExportSpacingConfig,
+  type PdfExportSpacingConfig,
+} from './lib/pdfExportConfig'
 import {
   alphaLabel,
   countAreaTokens,
@@ -19,11 +27,19 @@ import {
   stripTrailingSlash,
   toLocalStorage,
 } from './lib/questionUtils'
-import type { AiSettings, ChoiceMode, Question, QuestionType, SubjectKey } from './types'
+import type {
+  AiSettings,
+  ChoiceMode,
+  ChoiceSubQuestion,
+  OptionStyle,
+  Question,
+  QuestionType,
+  SubjectKey,
+} from './types'
 
 type CreditFilter = 'all' | 'humanities' | 'science' | 'other'
 type TypeFilter = QuestionType | 'all'
-type AnalysisTarget = 'choice' | 'blank' | 'subjective'
+type AnalysisTarget = 'choice' | 'choiceGroup' | 'blank' | 'subjective'
 type PdfExportTarget = 'plain' | 'analysis'
 
 interface DraftState {
@@ -31,11 +47,12 @@ interface DraftState {
   type: QuestionType
   stem: string
   choiceMode: ChoiceMode
-  optionStyle: 'latin' | 'circle'
+  optionStyle: OptionStyle
   optionCount: number
   options: string[]
   choiceAnswers: number[]
   choiceAnalysis: string
+  choiceGroupQuestions: ChoiceSubQuestion[]
   fillAnswers: string[]
   fillAnalysis: string
   subjectiveAnswers: string[]
@@ -43,6 +60,13 @@ interface DraftState {
 }
 
 interface ParsedAiResponse {
+  analysisMarkdown: string
+  generatedAnswers: string[]
+  answerReasonable: boolean | null
+  reasonabilityComment: string
+}
+
+interface ParsedChoiceGroupAiItem {
   analysisMarkdown: string
   generatedAnswers: string[]
   answerReasonable: boolean | null
@@ -68,8 +92,14 @@ const INITIAL_AI_SETTINGS: AiSettings = {
 
 const QUESTION_TYPE_LABEL: Record<QuestionType, string> = {
   choice: '选择题',
+  choiceGroup: '选择题（多空）',
   blank: '填空题',
   subjective: '主观题',
+}
+
+const PDF_EXPORT_TARGET_LABEL: Record<PdfExportTarget, string> = {
+  plain: '题面 PDF',
+  analysis: '题面及答案 PDF',
 }
 
 const CHOICE_MODE_LABEL: Record<ChoiceMode, string> = {
@@ -271,6 +301,30 @@ function buildUserMessageContent(prompt: string, imageMemory: Record<string, str
   return hasResolvedImage ? parts : prompt
 }
 
+function createChoiceSubQuestion(seed?: Partial<ChoiceSubQuestion>): ChoiceSubQuestion {
+  const optionCount = Math.min(8, Math.max(2, Number(seed?.optionCount) || 4))
+  const options = Array.isArray(seed?.options)
+    ? ensureLength(
+        seed.options.map((item) => String(item ?? '')),
+        Math.max(8, optionCount),
+      )
+    : Array.from({ length: 8 }, () => '')
+
+  const choiceMode = (seed?.choiceMode as ChoiceMode | undefined) ?? 'single'
+
+  return {
+    id: seed?.id ?? generateUuid(),
+    stem: seed?.stem ?? '',
+    normalizedStem: seed?.normalizedStem ?? '',
+    choiceMode,
+    optionStyle: (seed?.optionStyle as OptionStyle | undefined) ?? 'latin',
+    optionCount,
+    options,
+    correctAnswers: sanitizeChoiceAnswers(choiceMode, seed?.correctAnswers ?? [], optionCount),
+    analysis: seed?.analysis ?? '',
+  }
+}
+
 const createInitialDraft = (): DraftState => ({
   subject: 'math',
   type: 'choice',
@@ -281,6 +335,7 @@ const createInitialDraft = (): DraftState => ({
   options: Array.from({ length: 8 }, () => ''),
   choiceAnswers: [],
   choiceAnalysis: '',
+  choiceGroupQuestions: [createChoiceSubQuestion()],
   fillAnswers: [],
   fillAnalysis: '',
   subjectiveAnswers: [''],
@@ -307,6 +362,30 @@ function buildDraftFromQuestion(
         question.optionCount,
       ),
       choiceAnalysis: normalizeMarkdownForEdit(question.analysis),
+    }
+  }
+
+  if (question.type === 'choiceGroup') {
+    return {
+      ...createInitialDraft(),
+      subject: question.subject,
+      type: 'choiceGroup',
+      stem: normalizeMarkdownForEdit(question.stem),
+      choiceGroupQuestions:
+        question.subquestions.length > 0
+          ? question.subquestions.map((item) =>
+              createChoiceSubQuestion({
+                ...item,
+                stem: normalizeMarkdownForEdit(item.stem),
+                normalizedStem: normalizeMarkdownForEdit(item.normalizedStem),
+                options: ensureLength(
+                  item.options.map((option) => normalizeMarkdownForEdit(option)),
+                  8,
+                ),
+                analysis: normalizeMarkdownForEdit(item.analysis),
+              }),
+            )
+          : [createChoiceSubQuestion()],
     }
   }
 
@@ -346,7 +425,7 @@ function parseEditQuestionIdFromPath(pathname: string): string | null {
   }
 }
 
-function getOptionMarker(index: number, style: 'latin' | 'circle'): string {
+function getOptionMarker(index: number, style: OptionStyle): string {
   if (style === 'circle') {
     return CIRCLE_LABELS[index] ?? `(${index + 1})`
   }
@@ -754,10 +833,76 @@ function parseAiResponse(raw: string): ParsedAiResponse {
   }
 }
 
+function parseChoiceGroupAiResponse(raw: string, count: number): ParsedChoiceGroupAiItem[] | null {
+  const candidate = extractJsonCandidate(raw)
+  if (!candidate) {
+    return null
+  }
+
+  const json = parseJsonCandidate(candidate)
+  if (!json) {
+    return null
+  }
+
+  const rootItems = Array.isArray(json.subquestions)
+    ? json.subquestions
+    : Array.isArray(json.questions)
+      ? json.questions
+      : Array.isArray(json.items)
+        ? json.items
+        : null
+
+  if (!rootItems) {
+    return null
+  }
+
+  const normalizedItems = rootItems
+    .slice(0, count)
+    .map((item): ParsedChoiceGroupAiItem | null => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+      const source = item as Record<string, unknown>
+      const analysisValue =
+        (typeof source.analysis_markdown === 'string' && source.analysis_markdown) ||
+        (typeof source.analysis === 'string' && source.analysis) ||
+        (typeof source['解析'] === 'string' && (source['解析'] as string)) ||
+        ''
+
+      const generatedAnswers = normalizeToStringArray(
+        source.generated_answers ?? source.answers ?? source['答案'] ?? source.suggested_answers,
+      )
+
+      const answerReasonableRaw =
+        source.answer_reasonable ??
+        source.is_reasonable ??
+        source.reasonable ??
+        source['答案是否合理']
+      const answerReasonable =
+        typeof answerReasonableRaw === 'boolean' ? answerReasonableRaw : null
+
+      const reasonabilityComment =
+        (typeof source.reasonability_comment === 'string' && source.reasonability_comment) ||
+        (typeof source.reason === 'string' && source.reason) ||
+        (typeof source.comment === 'string' && source.comment) ||
+        ''
+
+      return {
+        analysisMarkdown: String(analysisValue || '').trim(),
+        generatedAnswers,
+        answerReasonable,
+        reasonabilityComment,
+      }
+    })
+    .filter((item): item is ParsedChoiceGroupAiItem => item !== null)
+
+  return normalizedItems.length === count ? normalizedItems : null
+}
+
 function parseChoiceAnswerIndices(
   rawAnswers: string[],
   optionCount: number,
-  optionStyle: 'latin' | 'circle',
+  optionStyle: OptionStyle,
 ): number[] {
   const source = rawAnswers.join(' ').toUpperCase()
   const result = new Set<number>()
@@ -797,7 +942,7 @@ function parseChoiceAnswerIndices(
   return [...result].sort((a, b) => a - b)
 }
 
-function buildChoiceDisplayMarkdown(question: Question & { type: 'choice' }): string {
+function buildChoiceDisplayMarkdown(question: Extract<Question, { type: 'choice' }>): string {
   const stemBase = migrateStemTokens(question.normalizedStem)
   const stemWithToken =
     countInlineTokens(stemBase) > 0 ? stemBase : `${stemBase.trimEnd()} [[INLINE_BLANK_1]]`.trim()
@@ -814,14 +959,41 @@ function buildChoiceDisplayMarkdown(question: Question & { type: 'choice' }): st
   return optionLines ? `${filledStem}\n\n${optionLines}` : filledStem
 }
 
-function buildBlankDisplayMarkdown(question: Question & { type: 'blank' }): string {
+function buildChoiceGroupDisplayMarkdown(question: Extract<Question, { type: 'choiceGroup' }>): string {
+  const sections = question.subquestions.map((subquestion, index) => {
+    const stemBase = migrateStemTokens(subquestion.normalizedStem)
+    const stemWithToken =
+      countInlineTokens(stemBase) > 0 ? stemBase : `${stemBase.trimEnd()} [[INLINE_BLANK_1]]`.trim()
+    const answerText = subquestion.correctAnswers
+      .map((answerIndex) => getOptionMarker(answerIndex, subquestion.optionStyle))
+      .join('、')
+    const filledStem = replaceInlineBlanksWithValues(stemWithToken, [answerText])
+    const optionLines = subquestion.options
+      .slice(0, subquestion.optionCount)
+      .map(
+        (option, optionIndex) =>
+          `**${getOptionMarker(optionIndex, subquestion.optionStyle)}** ${flattenOptionText(option)}`,
+      )
+      .join('\n\n')
+
+    return [`### 第 ${index + 1} 题`, filledStem, optionLines].filter(Boolean).join('\n\n')
+  })
+
+  if (question.stem.trim().length === 0) {
+    return sections.join('\n\n---\n\n')
+  }
+
+  return ['**共享材料**', question.stem, ...sections].join('\n\n')
+}
+
+function buildBlankDisplayMarkdown(question: Extract<Question, { type: 'blank' }>): string {
   const stemBase = migrateStemTokens(question.normalizedStem)
   const stemWithToken =
     countInlineTokens(stemBase) > 0 ? stemBase : `${stemBase.trimEnd()} [[INLINE_BLANK_1]]`.trim()
   return replaceInlineBlanksWithValues(stemWithToken, question.answers)
 }
 
-function buildSubjectiveDisplayMarkdown(question: Question & { type: 'subjective' }): string {
+function buildSubjectiveDisplayMarkdown(question: Extract<Question, { type: 'subjective' }>): string {
   const areaCount = countAreaTokens(question.normalizedStem)
   if (areaCount < 1) {
     if (question.answers.length > 0) {
@@ -834,8 +1006,26 @@ function buildSubjectiveDisplayMarkdown(question: Question & { type: 'subjective
 
 function buildQuestionDisplayMarkdown(question: Question): string {
   if (question.type === 'choice') return buildChoiceDisplayMarkdown(question)
+  if (question.type === 'choiceGroup') return buildChoiceGroupDisplayMarkdown(question)
   if (question.type === 'blank') return buildBlankDisplayMarkdown(question)
   return buildSubjectiveDisplayMarkdown(question)
+}
+
+function buildQuestionAnalysisMarkdown(question: Question): string {
+  if (question.type === 'choiceGroup') {
+    return question.subquestions
+      .map((subquestion, index) => {
+        const analysis = subquestion.analysis.trim()
+        if (!analysis) {
+          return ''
+        }
+        return `### 第 ${index + 1} 题解析\n\n${analysis}`
+      })
+      .filter(Boolean)
+      .join('\n\n---\n\n')
+  }
+
+  return 'analysis' in question ? question.analysis : ''
 }
 
 function hydrateQuestions(input: unknown): Question[] {
@@ -892,6 +1082,60 @@ function hydrateQuestions(input: unknown): Question[] {
             correctedOptionCount,
           ),
           analysis: String(item.analysis ?? ''),
+        }
+      }
+
+      if (type === 'choiceGroup') {
+        const rawSubquestions = Array.isArray(item.subquestions) ? item.subquestions : []
+        const subquestions = rawSubquestions
+          .map((rawSubquestion) => {
+            if (!rawSubquestion || typeof rawSubquestion !== 'object') {
+              return null
+            }
+
+            const subItem = rawSubquestion as Record<string, unknown>
+            const rawNormalized = migrateStemTokens(
+              String(subItem.normalizedStem ?? subItem.stem ?? ''),
+            )
+            const normalizedStem =
+              countInlineTokens(rawNormalized) > 0
+                ? rawNormalized
+                : `${rawNormalized.trimEnd()} [[INLINE_BLANK_1]]`.trim()
+
+            const options = Array.isArray(subItem.options)
+              ? subItem.options.map((value) => String(value ?? ''))
+              : []
+
+            const optionCount = Number(subItem.optionCount ?? options.length ?? 4)
+            const correctedOptionCount = Math.min(8, Math.max(2, optionCount || 4))
+            const paddedOptions = ensureLength(options, Math.max(8, correctedOptionCount))
+
+            const answers = Array.isArray(subItem.correctAnswers)
+              ? subItem.correctAnswers
+                  .map((value) => Number(value))
+                  .filter((value) => Number.isFinite(value))
+              : []
+
+            const choiceMode = (subItem.choiceMode as ChoiceMode) ?? 'single'
+            return createChoiceSubQuestion({
+              id: String(subItem.id ?? generateUuid()),
+              stem: String(subItem.stem ?? ''),
+              normalizedStem,
+              choiceMode,
+              optionStyle: (subItem.optionStyle as OptionStyle) ?? 'latin',
+              optionCount: correctedOptionCount,
+              options: paddedOptions,
+              correctAnswers: sanitizeChoiceAnswers(choiceMode, answers, correctedOptionCount),
+              analysis: String(subItem.analysis ?? ''),
+            })
+          })
+          .filter((subquestion): subquestion is ChoiceSubQuestion => subquestion !== null)
+
+        return {
+          ...base,
+          type: 'choiceGroup' as const,
+          normalizedStem: String(item.normalizedStem ?? item.stem ?? ''),
+          subquestions: subquestions.length > 0 ? subquestions : [createChoiceSubQuestion()],
         }
       }
 
@@ -968,6 +1212,10 @@ function App() {
   const [aiLoadingTarget, setAiLoadingTarget] = useState<AnalysisTarget | null>(null)
   const [pdfExporting, setPdfExporting] = useState(false)
   const [pdfExportingTarget, setPdfExportingTarget] = useState<PdfExportTarget | null>(null)
+  const [pdfExportDialogTarget, setPdfExportDialogTarget] = useState<PdfExportTarget | null>(null)
+  const [pdfExportConfig, setPdfExportConfig] = useState<PdfExportSpacingConfig>(() =>
+    loadPdfExportSpacingConfig(),
+  )
 
   const [bankCreditFilter, setBankCreditFilter] = useState<CreditFilter>('all')
   const [bankTypeFilter, setBankTypeFilter] = useState<TypeFilter>('all')
@@ -1205,9 +1453,7 @@ function App() {
       bankList.map((question) => ({
         question,
         displayMarkdown: resolveMarkdownForRender(buildQuestionDisplayMarkdown(question)),
-        analysisMarkdown: question.analysis
-          ? resolveMarkdownForRender(question.analysis)
-          : '',
+        analysisMarkdown: resolveMarkdownForRender(buildQuestionAnalysisMarkdown(question)),
       })),
     [bankList, resolveMarkdownForRender],
   )
@@ -1313,6 +1559,15 @@ function App() {
 
   const updateQuestionType = (type: QuestionType) => {
     setDraft((prev) => {
+      if (type === 'choiceGroup') {
+        return {
+          ...prev,
+          type,
+          choiceGroupQuestions:
+            prev.choiceGroupQuestions.length > 0 ? prev.choiceGroupQuestions : [createChoiceSubQuestion()],
+        }
+      }
+
       if (type === 'blank') {
         const nextSlotCount = Math.max(1, detectInlineBlankCount(prev.stem))
         return {
@@ -1387,6 +1642,116 @@ function App() {
     })
   }
 
+  const updateChoiceGroupQuestion = (
+    questionId: string,
+    updater: (question: ChoiceSubQuestion) => ChoiceSubQuestion,
+  ) => {
+    setDraft((prev) => ({
+      ...prev,
+      choiceGroupQuestions: prev.choiceGroupQuestions.map((question) =>
+        question.id === questionId ? updater(question) : question,
+      ),
+    }))
+  }
+
+  const addChoiceGroupQuestion = () => {
+    setDraft((prev) => ({
+      ...prev,
+      choiceGroupQuestions: [...prev.choiceGroupQuestions, createChoiceSubQuestion()],
+    }))
+  }
+
+  const removeChoiceGroupQuestion = (questionId: string) => {
+    setDraft((prev) => {
+      if (prev.choiceGroupQuestions.length <= 1) {
+        return prev
+      }
+      return {
+        ...prev,
+        choiceGroupQuestions: prev.choiceGroupQuestions.filter((question) => question.id !== questionId),
+      }
+    })
+  }
+
+  const updateChoiceGroupStem = (questionId: string, value: string) => {
+    const normalized = normalizeMarkdownForEdit(value)
+    updateChoiceGroupQuestion(questionId, (question) => ({
+      ...question,
+      stem: normalized,
+    }))
+  }
+
+  const updateChoiceGroupMode = (questionId: string, value: ChoiceMode) => {
+    updateChoiceGroupQuestion(questionId, (question) => ({
+      ...question,
+      choiceMode: value,
+      correctAnswers: sanitizeChoiceAnswers(value, question.correctAnswers, question.optionCount),
+    }))
+  }
+
+  const updateChoiceGroupOptionStyle = (questionId: string, value: OptionStyle) => {
+    updateChoiceGroupQuestion(questionId, (question) => ({
+      ...question,
+      optionStyle: value,
+    }))
+  }
+
+  const updateChoiceGroupOptionCount = (questionId: string, rawCount: number) => {
+    const count = Math.min(8, Math.max(2, rawCount))
+    updateChoiceGroupQuestion(questionId, (question) => {
+      const nextOptions =
+        count > question.options.length
+          ? [...question.options, ...Array.from({ length: count - question.options.length }, () => '')]
+          : question.options
+
+      return {
+        ...question,
+        optionCount: count,
+        options: nextOptions,
+        correctAnswers: sanitizeChoiceAnswers(question.choiceMode, question.correctAnswers, count),
+      }
+    })
+  }
+
+  const updateChoiceGroupOption = (questionId: string, optionIndex: number, value: string) => {
+    updateChoiceGroupQuestion(questionId, (question) => {
+      const nextOptions = [...question.options]
+      nextOptions[optionIndex] = value
+      return {
+        ...question,
+        options: nextOptions,
+      }
+    })
+  }
+
+  const toggleChoiceGroupAnswer = (questionId: string, answerIndex: number) => {
+    updateChoiceGroupQuestion(questionId, (question) => {
+      if (question.choiceMode === 'single') {
+        return {
+          ...question,
+          correctAnswers: [answerIndex],
+        }
+      }
+
+      const exists = question.correctAnswers.includes(answerIndex)
+      const next = exists
+        ? question.correctAnswers.filter((item) => item !== answerIndex)
+        : [...question.correctAnswers, answerIndex]
+
+      return {
+        ...question,
+        correctAnswers: sanitizeChoiceAnswers(question.choiceMode, next, question.optionCount),
+      }
+    })
+  }
+
+  const updateChoiceGroupAnalysis = (questionId: string, value: string) => {
+    updateChoiceGroupQuestion(questionId, (question) => ({
+      ...question,
+      analysis: normalizeMarkdownForEdit(value),
+    }))
+  }
+
   const toggleChoiceAnswer = (index: number) => {
     setDraft((prev) => {
       if (prev.choiceMode === 'single') {
@@ -1444,7 +1809,7 @@ function App() {
   const submitQuestion = () => {
     const stem = draft.stem.trim()
     if (!stem) {
-      setNotice('请先输入题面。')
+      setNotice(draft.type === 'choiceGroup' ? '请先输入共享材料。' : '请先输入题面。')
       return
     }
 
@@ -1510,6 +1875,125 @@ function App() {
         } else {
           setNotice('选择题已更新。')
         }
+      } else {
+        setNotice('创建成功')
+      }
+
+      setDraft((prev) => ({
+        ...createInitialDraft(),
+        subject: prev.subject,
+        type: prev.type,
+      }))
+      if (originalQuestion) {
+        navigate('/bank', { replace: true })
+      }
+      return
+    }
+
+    if (draft.type === 'choiceGroup') {
+      const subquestions = draft.choiceGroupQuestions.map((subquestion, index) => {
+        const normalized = normalizeChoiceStem(subquestion.stem.trim())
+        const options = subquestion.options.slice(0, subquestion.optionCount).map((item) => item.trim())
+        const answers = sanitizeChoiceAnswers(
+          subquestion.choiceMode,
+          subquestion.correctAnswers,
+          subquestion.optionCount,
+        )
+
+        return {
+          index,
+          subquestion,
+          normalized,
+          options,
+          answers,
+        }
+      })
+
+      if (subquestions.length === 0) {
+        setNotice('请至少保留 1 道子题。')
+        return
+      }
+
+      for (const item of subquestions) {
+        if (!item.subquestion.stem.trim()) {
+          setNotice(`请先补全第 ${item.index + 1} 道子题的题面。`)
+          return
+        }
+
+        if (item.options.some((option) => option.length === 0)) {
+          setNotice(`第 ${item.index + 1} 道子题仍有空白选项，请补全后再保存。`)
+          return
+        }
+
+        if (!validateChoiceAnswers(item.subquestion.choiceMode, item.answers)) {
+          if (item.subquestion.choiceMode === 'single') {
+            setNotice(`第 ${item.index + 1} 道子题必须且只能选择 1 个正确选项。`)
+            return
+          }
+          if (item.subquestion.choiceMode === 'double') {
+            setNotice(`第 ${item.index + 1} 道子题必须选择 2 个正确选项。`)
+            return
+          }
+          setNotice(`第 ${item.index + 1} 道子题至少要有 1 个正确选项。`)
+          return
+        }
+      }
+
+      const nextQuestion: Question = {
+        id: questionId,
+        subject: draft.subject,
+        type: 'choiceGroup',
+        stem: materializeMarkdownForStorage(stem),
+        normalizedStem: materializeMarkdownForStorage(stem),
+        createdAt,
+        updatedAt: now,
+        subquestions: subquestions.map(({ subquestion, normalized, options, answers }) => ({
+          id: subquestion.id,
+          stem: materializeMarkdownForStorage(subquestion.stem.trim()),
+          normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem),
+          choiceMode: subquestion.choiceMode,
+          optionStyle: subquestion.optionStyle,
+          optionCount: subquestion.optionCount,
+          options: options.map((option) => materializeMarkdownForStorage(option)),
+          correctAnswers: answers,
+          analysis: materializeMarkdownForStorage(subquestion.analysis.trim()),
+        })),
+      }
+
+      setQuestions((prev) =>
+        originalQuestion
+          ? prev.map((item) => (item.id === questionId ? nextQuestion : item))
+          : [nextQuestion, ...prev],
+      )
+      if (!originalQuestion) {
+        toLocalStorage(LAST_CREATED_SUBJECT_KEY, draft.subject)
+      }
+
+      const appendedCount = subquestions.filter((item) => item.normalized.appended).length
+      const multipleCount = subquestions.filter((item) => item.normalized.hadMultiple).length
+
+      if (originalQuestion) {
+        if (appendedCount > 0 || multipleCount > 0) {
+          const parts: string[] = []
+          if (appendedCount > 0) {
+            parts.push(`${appendedCount} 道子题未识别到空位，已自动补空位`)
+          }
+          if (multipleCount > 0) {
+            parts.push(`${multipleCount} 道子题存在多个空位，已按最后一个空位处理`)
+          }
+          setNotice(`多空选择题已更新。${parts.join('；')}。`)
+        } else {
+          setNotice('多空选择题已更新。')
+        }
+      } else if (appendedCount > 0 || multipleCount > 0) {
+        const parts: string[] = []
+        if (appendedCount > 0) {
+          parts.push(`${appendedCount} 道子题未识别到空位，已自动补空位`)
+        }
+        if (multipleCount > 0) {
+          parts.push(`${multipleCount} 道子题存在多个空位，已按最后一个空位处理`)
+        }
+        setNotice(`创建成功。${parts.join('；')}。`)
       } else {
         setNotice('创建成功')
       }
@@ -1626,7 +2110,7 @@ function App() {
 
     const stem = draft.stem.trim()
     if (!stem) {
-      setNotice('请先输入题面。')
+      setNotice(target === 'choiceGroup' ? '请先输入共享材料。' : '请先输入题面。')
       return
     }
 
@@ -1642,6 +2126,50 @@ function App() {
         .map((index) => getOptionMarker(index, draft.optionStyle))
         .join('、')
       answerCount = draft.choiceMode === 'double' ? 2 : 1
+    } else if (target === 'choiceGroup') {
+      if (draft.choiceGroupQuestions.length === 0) {
+        setNotice('请至少保留 1 道子题。')
+        return
+      }
+
+      const invalidSubquestion = draft.choiceGroupQuestions.find((subquestion, index) => {
+        if (!subquestion.stem.trim()) {
+          setNotice(`请先补全第 ${index + 1} 道子题的题面。`)
+          return true
+        }
+        const options = subquestion.options.slice(0, subquestion.optionCount).map((item) => item.trim())
+        if (options.some((item) => item.length === 0)) {
+          setNotice(`请先补全第 ${index + 1} 道子题的选项，再生成解析。`)
+          return true
+        }
+        return false
+      })
+      if (invalidSubquestion) {
+        return
+      }
+
+      const answerSummaries = draft.choiceGroupQuestions.map((subquestion, index) => {
+        const selected = sanitizeChoiceAnswers(
+          subquestion.choiceMode,
+          subquestion.correctAnswers,
+          subquestion.optionCount,
+        )
+        const valid = validateChoiceAnswers(subquestion.choiceMode, selected)
+        return {
+          index,
+          selected,
+          valid,
+          markerText: selected.map((item) => getOptionMarker(item, subquestion.optionStyle)).join('、'),
+        }
+      })
+
+      answerProvided = answerSummaries.every((item) => item.valid)
+      givenAnswerText = answerSummaries
+        .map((item) =>
+          `第${item.index + 1}题：${item.valid ? item.markerText || '（空）' : '未填写完整'}`,
+        )
+        .join('\n')
+      answerCount = draft.choiceGroupQuestions.length
     } else if (target === 'blank') {
       answerCount = Math.max(1, normalizeBlankStem(stem).blankCount)
       const answers = ensureLength(draft.fillAnswers, answerCount)
@@ -1680,7 +2208,9 @@ function App() {
     const subjectLabel = SUBJECT_MAP[draft.subject].label
     const endpoint = buildAIEndpoint(settings.baseUrl)
 
-    let questionBody = `学科：${subjectLabel}\n题型：${QUESTION_TYPE_LABEL[target]}\n\n题面：\n${stem}\n`
+    let questionBody = `学科：${subjectLabel}\n题型：${QUESTION_TYPE_LABEL[target]}\n\n${
+      target === 'choiceGroup' ? '共享材料' : '题面'
+    }：\n${stem}\n`
 
     if (target === 'choice') {
       const options = draft.options.slice(0, draft.optionCount).map((item) => item.trim())
@@ -1692,6 +2222,25 @@ function App() {
         .map((option, index) => `${getOptionMarker(index, draft.optionStyle)} ${option}`)
         .join('\n')
       questionBody += `\n选项：\n${optionsText}\n`
+    }
+
+    if (target === 'choiceGroup') {
+      const subquestionText = draft.choiceGroupQuestions
+        .map((subquestion, index) => {
+          const options = subquestion.options.slice(0, subquestion.optionCount).map((item) => item.trim())
+          const optionsText = options
+            .map((option, optionIndex) => `${getOptionMarker(optionIndex, subquestion.optionStyle)} ${option}`)
+            .join('\n')
+          return [
+            `第${index + 1}题`,
+            `子类型：${CHOICE_MODE_LABEL[subquestion.choiceMode]}`,
+            `选项风格：${subquestion.optionStyle === 'circle' ? '①②③' : 'ABCD'}`,
+            `题面：\n${subquestion.stem.trim()}`,
+            `选项：\n${optionsText}`,
+          ].join('\n')
+        })
+        .join('\n\n')
+      questionBody += `\n子题列表：\n${subquestionText}\n`
     }
 
     if (answerProvided) {
@@ -1710,8 +2259,11 @@ function App() {
       '可使用 Markdown 列表与 LaTeX；整体解析以自然段为主。',
       '解析总字数尽量控制在 400 字以内。',
       '结尾不要写“当前答案可以成立”等审查式语句。',
-      `generated_answers 若需要提供答案，长度应为 ${answerCount}（选择题可用选项标识符）。`,
     ]
+
+    if (target !== 'choiceGroup') {
+      policyLines.push(`generated_answers 若需要提供答案，长度应为 ${answerCount}（选择题可用选项标识符）。`)
+    }
 
     if (target === 'choice') {
       policyLines.push(
@@ -1722,6 +2274,19 @@ function App() {
       )
       if (isHumanities) {
         policyLines.push('文科选择题需结合题干材料与所学知识说明依据，并尽量指出对应来源。')
+      }
+    }
+
+    if (target === 'choiceGroup') {
+      policyLines.push('这是共享材料下的多道独立选择题，必须逐题分析，不可混答。')
+      policyLines.push(
+        '必须优先返回 JSON（可放在 ```json 代码块中），格式为 {"subquestions":[{"analysis_markdown":"...","generated_answers":["A"],"answer_reasonable":true/false/null,"reasonability_comment":"..."}, ...]}。',
+      )
+      policyLines.push('subquestions 数组长度必须与子题数量完全一致，顺序必须和题目顺序一致。')
+      policyLines.push('每个 analysis_markdown 仅对应各自子题，不要合并成总解析。')
+      policyLines.push('每个 generated_answers 只填写对应子题的答案；单选/双选/不定项都可用选项标识符。')
+      if (isHumanities) {
+        policyLines.push('文科多空选择题需结合共享材料与所学知识逐题说明依据，并尽量指出对应来源。')
       }
     }
 
@@ -1843,6 +2408,95 @@ function App() {
         return
       }
 
+      if (target === 'choiceGroup') {
+        const parsedGroup = parseChoiceGroupAiResponse(content, draft.choiceGroupQuestions.length)
+        if (!parsedGroup) {
+          throw new Error('AI 返回格式不完整，未识别到多空选择题的逐题 JSON 结果。')
+        }
+
+        const suggestedPerQuestion = parsedGroup.map((item, index) => {
+          const subquestion = draft.choiceGroupQuestions[index]
+          const indices = parseChoiceAnswerIndices(
+            item.generatedAnswers,
+            subquestion.optionCount,
+            subquestion.optionStyle,
+          )
+          const generated = sanitizeChoiceAnswers(subquestion.choiceMode, indices, subquestion.optionCount)
+          return {
+            generated,
+            analysis: item.analysisMarkdown,
+            answerReasonable: item.answerReasonable,
+            reasonabilityComment: item.reasonabilityComment,
+            valid: validateChoiceAnswers(subquestion.choiceMode, generated),
+          }
+        })
+
+        if (shouldGenerateAnswers) {
+          const allValid = suggestedPerQuestion.every((item) => item.valid)
+          setDraft((prev) => ({
+            ...prev,
+            choiceGroupQuestions: prev.choiceGroupQuestions.map((subquestion, index) => ({
+              ...subquestion,
+              analysis: suggestedPerQuestion[index].analysis || subquestion.analysis,
+              correctAnswers: suggestedPerQuestion[index].valid
+                ? suggestedPerQuestion[index].generated
+                : subquestion.correctAnswers,
+            })),
+          }))
+          setNotice(
+            allValid
+              ? 'AI 已生成多空选择题答案与解析。'
+              : 'AI 已生成多空选择题解析，但部分答案格式不完整，请手动确认。',
+          )
+          return
+        }
+
+        if (shouldCheckReasonability) {
+          const replaceableIndices = suggestedPerQuestion
+            .map((item, index) =>
+              item.answerReasonable === false && item.valid ? index : -1,
+            )
+            .filter((index) => index >= 0)
+
+          if (replaceableIndices.length > 0) {
+            const reasons = replaceableIndices
+              .map((index) => {
+                const reasonText =
+                  suggestedPerQuestion[index].reasonabilityComment || 'AI 认为当前答案可能不合理。'
+                return `第${index + 1}题：${reasonText}`
+              })
+              .join('\n')
+
+            const confirmed = window.confirm(`${reasons}\n\n是否使用 AI 建议答案覆盖这些子题的当前答案？`)
+
+            setDraft((prev) => ({
+              ...prev,
+              choiceGroupQuestions: prev.choiceGroupQuestions.map((subquestion, index) => ({
+                ...subquestion,
+                analysis: suggestedPerQuestion[index].analysis || subquestion.analysis,
+                correctAnswers:
+                  confirmed && replaceableIndices.includes(index)
+                    ? suggestedPerQuestion[index].generated
+                    : subquestion.correctAnswers,
+              })),
+            }))
+
+            setNotice(confirmed ? 'AI 建议答案已覆盖，解析已更新。' : '已保留原答案，仅更新解析。')
+            return
+          }
+        }
+
+        setDraft((prev) => ({
+          ...prev,
+          choiceGroupQuestions: prev.choiceGroupQuestions.map((subquestion, index) => ({
+            ...subquestion,
+            analysis: suggestedPerQuestion[index].analysis || subquestion.analysis,
+          })),
+        }))
+        setNotice('多空选择题 AI 解析已生成。')
+        return
+      }
+
       if (target === 'blank') {
         const requiredCount = Math.max(1, normalizeBlankStem(stem).blankCount)
         const suggested = ensureLength(parsed.generatedAnswers, requiredCount)
@@ -1952,12 +2606,33 @@ function App() {
     }
   }
 
-  const exportPdf = async (target: PdfExportTarget) => {
-    const includeAnalysis = target === 'analysis'
+  const openPdfExportDialog = (target: PdfExportTarget) => {
     if (bankList.length === 0) {
       setNotice('当前筛选下暂无题目可导出。')
       return
     }
+
+    setPdfExportDialogTarget(target)
+    setPdfExportConfig(loadPdfExportSpacingConfig())
+  }
+
+  const persistPdfExportConfig = (config: PdfExportSpacingConfig, message: string) => {
+    const sanitized = sanitizePdfExportSpacingConfig(config)
+    savePdfExportSpacingConfig(sanitized)
+    setPdfExportConfig(sanitized)
+    setNotice(message)
+  }
+
+  const resetPdfExportConfig = () => {
+    persistPdfExportConfig(DEFAULT_PDF_EXPORT_SPACING_CONFIG, '导出配置已重置为默认值。')
+  }
+
+  const savePdfExportConfigLocally = () => {
+    persistPdfExportConfig(pdfExportConfig, '导出配置已保存到浏览器本地。')
+  }
+
+  const exportPdf = async (target: PdfExportTarget, config: PdfExportSpacingConfig) => {
+    const includeAnalysis = target === 'analysis'
 
     setPdfExporting(true)
     setPdfExportingTarget(target)
@@ -1966,8 +2641,10 @@ function App() {
       const { exportQuestionsAsPdf } = await import('./lib/pdfExport')
       const result = await exportQuestionsAsPdf(bankList, {
         includeAnalysis,
+        spacingConfig: sanitizePdfExportSpacingConfig(config),
       })
       setNotice(result.message)
+      setPdfExportDialogTarget(null)
     } catch (error) {
       const message = error instanceof Error ? error.message : '导出 PDF 失败，请重试。'
       setNotice(message)
@@ -1983,6 +2660,11 @@ function App() {
     draft.subjectiveAnswers.length - subjectiveSlotCount,
     0,
   )
+  const stemEditorLabel = draft.type === 'choiceGroup' ? '共享材料' : '题面'
+  const stemEditorPlaceholder =
+    draft.type === 'choiceGroup'
+      ? `可输入 Markdown 与 LaTeX，作为多道子题共享的材料。\n子题题面请在下方分别填写；每道子题仍可用括号、下划线或两侧有空白字符的 ▲ 表示空位。`
+      : `可输入 Markdown 与 LaTeX。\n选择题/填空题可用括号、下划线，或两侧有空白字符的 ▲ 表示空位；材料题可用连续换行或独立 ▲ 表示大面积留空。`
 
   const navigateToTab = (tab: 'create' | 'bank' | 'settings') => {
     navigate(`/${tab}`)
@@ -2193,15 +2875,14 @@ function App() {
                 </div>
 
                 <MarkdownEditor
-                  label="题面"
+                  label={stemEditorLabel}
                   value={draft.stem}
                   onChange={updateStem}
                   allowImages
                   onResolveImageDataUrl={rememberImageInMemory}
                   resolveMarkdownForPreview={resolveMarkdownForPreview}
                   minRows={8}
-                  placeholder={`可输入 Markdown 与 LaTeX。
-选择题/填空题可用括号、下划线，或两侧有空白字符的 ▲ 表示空位；材料题可用连续换行或独立 ▲ 表示大面积留空。`}
+                  placeholder={stemEditorPlaceholder}
                 />
 
                 {draft.type === 'choice' ? (
@@ -2330,6 +3011,197 @@ function App() {
                       minRows={6}
                       placeholder="可选。输入本题解析（Markdown/LaTeX）"
                     />
+                  </section>
+                ) : null}
+
+                {draft.type === 'choiceGroup' ? (
+                  <section className="section-block">
+                    <div className="section-headline">
+                      <div>
+                        <h3>多空选择题参数</h3>
+                        <p className="hint">
+                          共享材料只写一次；下方每道子题都有自己的题面、选项、答案与解析，互不共享。
+                        </p>
+                      </div>
+                      <div className="section-actions">
+                        <button
+                          type="button"
+                          className="ghost-btn"
+                          disabled={aiLoadingTarget !== null}
+                          onClick={() => {
+                            void generateAnalysisWithAI('choiceGroup')
+                          }}
+                        >
+                          {aiLoadingTarget === 'choiceGroup' ? '生成中...' : 'AI 生成答案与解析'}
+                        </button>
+                        <button type="button" className="ghost-btn" onClick={addChoiceGroupQuestion}>
+                          新增一题
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="group-question-list">
+                      {draft.choiceGroupQuestions.map((subquestion, groupIndex) => {
+                        const detectedBlankCount = detectInlineBlankCount(subquestion.stem)
+                        const visibleOptions = subquestion.options.slice(0, subquestion.optionCount)
+                        const hiddenOptionCount = Math.max(
+                          subquestion.options.length - subquestion.optionCount,
+                          0,
+                        )
+
+                        return (
+                          <section key={subquestion.id} className="group-question-card">
+                            <header className="group-question-head">
+                              <div>
+                                <h4>第 {groupIndex + 1} 题</h4>
+                                <p className="hint">可穿插单选、双选、不定项，以及不同选项风格。</p>
+                              </div>
+                              <button
+                                type="button"
+                                className="ghost-btn danger"
+                                onClick={() => removeChoiceGroupQuestion(subquestion.id)}
+                                disabled={draft.choiceGroupQuestions.length <= 1}
+                              >
+                                删除本题
+                              </button>
+                            </header>
+
+                            <MarkdownEditor
+                              label="子题题面"
+                              value={subquestion.stem}
+                              onChange={(value) => updateChoiceGroupStem(subquestion.id, value)}
+                              allowImages
+                              onResolveImageDataUrl={rememberImageInMemory}
+                              resolveMarkdownForPreview={resolveMarkdownForPreview}
+                              minRows={6}
+                              placeholder={`请输入第 ${groupIndex + 1} 题题面。\n可用括号、下划线，或两侧有空白字符的 ▲ 表示空位。`}
+                            />
+
+                            {detectedBlankCount === 0 ? (
+                              <p className="hint">未识别到空位时，系统会在该子题题面末尾自动追加一个空位。</p>
+                            ) : null}
+                            {detectedBlankCount > 1 ? (
+                              <p className="warn-text">
+                                当前子题识别到多个空位，保存时会按最后一个空位处理。
+                              </p>
+                            ) : null}
+
+                            <div className="inline-grid">
+                              <label>
+                                选择题子类型
+                                <select
+                                  value={subquestion.choiceMode}
+                                  onChange={(event) =>
+                                    updateChoiceGroupMode(
+                                      subquestion.id,
+                                      event.target.value as ChoiceMode,
+                                    )
+                                  }
+                                >
+                                  {(Object.keys(CHOICE_MODE_LABEL) as ChoiceMode[]).map((mode) => (
+                                    <option key={mode} value={mode}>
+                                      {CHOICE_MODE_LABEL[mode]}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+
+                              <label>
+                                选项风格
+                                <select
+                                  value={subquestion.optionStyle}
+                                  onChange={(event) =>
+                                    updateChoiceGroupOptionStyle(
+                                      subquestion.id,
+                                      event.target.value as OptionStyle,
+                                    )
+                                  }
+                                >
+                                  <option value="latin">ABCD</option>
+                                  <option value="circle">①②③</option>
+                                </select>
+                              </label>
+
+                              <label>
+                                选项数量
+                                <input
+                                  type="number"
+                                  min={2}
+                                  max={8}
+                                  value={subquestion.optionCount}
+                                  onChange={(event) =>
+                                    updateChoiceGroupOptionCount(
+                                      subquestion.id,
+                                      Number(event.target.value),
+                                    )
+                                  }
+                                />
+                              </label>
+                            </div>
+
+                            {hiddenOptionCount > 0 ? (
+                              <p className="hint">
+                                当前隐藏了 {hiddenOptionCount} 个选项草稿，若再调大数量可恢复内容。
+                              </p>
+                            ) : null}
+
+                            <div className="option-list">
+                              {visibleOptions.map((option, optionIndex) => (
+                                <div key={optionIndex} className="option-item">
+                                  <label>
+                                    选项 {getOptionMarker(optionIndex, subquestion.optionStyle)}
+                                    <textarea
+                                      rows={2}
+                                      value={option}
+                                      onChange={(event) =>
+                                        updateChoiceGroupOption(
+                                          subquestion.id,
+                                          optionIndex,
+                                          event.target.value,
+                                        )
+                                      }
+                                      placeholder={`请输入选项 ${getOptionMarker(optionIndex, subquestion.optionStyle)}（支持 Markdown，允许换行）`}
+                                    />
+                                  </label>
+                                  <div className="tiny-preview">
+                                    <MarkdownRenderer value={option} />
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+
+                            <div className="answer-board">
+                              <p>正确答案</p>
+                              <div>
+                                {visibleOptions.map((_option, optionIndex) => (
+                                  <label key={optionIndex}>
+                                    <input
+                                      type={subquestion.choiceMode === 'single' ? 'radio' : 'checkbox'}
+                                      checked={subquestion.correctAnswers.includes(optionIndex)}
+                                      onChange={() =>
+                                        toggleChoiceGroupAnswer(subquestion.id, optionIndex)
+                                      }
+                                    />
+                                    {getOptionMarker(optionIndex, subquestion.optionStyle)}
+                                  </label>
+                                ))}
+                              </div>
+                            </div>
+
+                            <MarkdownEditor
+                              label="解析"
+                              value={subquestion.analysis}
+                              onChange={(value) => updateChoiceGroupAnalysis(subquestion.id, value)}
+                              allowImages
+                              onResolveImageDataUrl={rememberImageInMemory}
+                              resolveMarkdownForPreview={resolveMarkdownForPreview}
+                              minRows={5}
+                              placeholder={`可选。输入第 ${groupIndex + 1} 题解析（Markdown/LaTeX）`}
+                            />
+                          </section>
+                        )
+                      })}
+                    </div>
                   </section>
                 ) : null}
 
@@ -2546,7 +3418,7 @@ function App() {
                 <button
                   type="button"
                   className="ghost-btn"
-                  onClick={() => void exportPdf('plain')}
+                  onClick={() => openPdfExportDialog('plain')}
                   disabled={pdfExporting}
                 >
                   {pdfExporting && pdfExportingTarget === 'plain' ? '导出中...' : '导出题面 PDF'}
@@ -2555,7 +3427,7 @@ function App() {
                 <button
                   type="button"
                   className="ghost-btn"
-                  onClick={() => void exportPdf('analysis')}
+                  onClick={() => openPdfExportDialog('analysis')}
                   disabled={pdfExporting}
                 >
                   {pdfExporting && pdfExportingTarget === 'analysis'
@@ -2611,6 +3483,30 @@ function App() {
               </div>
             </section>
           ) : null}
+
+          <ExportConfigModal
+            open={pdfExportDialogTarget !== null}
+            targetLabel={
+              pdfExportDialogTarget ? PDF_EXPORT_TARGET_LABEL[pdfExportDialogTarget] : '题面 PDF'
+            }
+            exporting={pdfExporting}
+            config={pdfExportConfig}
+            onChange={(key, value) =>
+              setPdfExportConfig((prev) => sanitizePdfExportSpacingConfig({ ...prev, [key]: value }))
+            }
+            onClose={() => setPdfExportDialogTarget(null)}
+            onReset={resetPdfExportConfig}
+            onSave={savePdfExportConfigLocally}
+            onConfirm={() => {
+              if (!pdfExportDialogTarget) {
+                return
+              }
+              const config = sanitizePdfExportSpacingConfig(pdfExportConfig)
+              savePdfExportSpacingConfig(config)
+              setPdfExportConfig(config)
+              void exportPdf(pdfExportDialogTarget, config)
+            }}
+          />
 
           {notice ? <div className="toast">{notice}</div> : null}
         </main>

@@ -35,6 +35,12 @@ async function sendWebResponse(res: ServerResponse, webRes: Response) {
 }
 
 export default defineConfig({
+  server: {
+    allowedHosts: ['cute', 'cute.local'],
+  },
+  preview: {
+    allowedHosts: ['cute', 'cute.local'],
+  },
   plugins: [
     react(),
     {

@@ -10,8 +10,9 @@ export type SubjectKey =
   | 'biology'
   | 'other'
 
-export type QuestionType = 'choice' | 'blank' | 'subjective'
+export type QuestionType = 'choice' | 'choiceGroup' | 'blank' | 'subjective'
 export type ChoiceMode = 'single' | 'double' | 'multiple'
+export type OptionStyle = 'latin' | 'circle'
 
 export interface SubjectInfo {
   key: SubjectKey
@@ -40,11 +41,28 @@ export interface BaseQuestion {
 export interface ChoiceQuestion extends BaseQuestion {
   type: 'choice'
   choiceMode: ChoiceMode
-  optionStyle: 'latin' | 'circle'
+  optionStyle: OptionStyle
   optionCount: number
   options: string[]
   correctAnswers: number[]
   analysis: string
+}
+
+export interface ChoiceSubQuestion {
+  id: string
+  stem: string
+  normalizedStem: string
+  choiceMode: ChoiceMode
+  optionStyle: OptionStyle
+  optionCount: number
+  options: string[]
+  correctAnswers: number[]
+  analysis: string
+}
+
+export interface ChoiceGroupQuestion extends BaseQuestion {
+  type: 'choiceGroup'
+  subquestions: ChoiceSubQuestion[]
 }
 
 export interface BlankQuestion extends BaseQuestion {
@@ -61,4 +79,4 @@ export interface SubjectiveQuestion extends BaseQuestion {
   analysis: string
 }
 
-export type Question = ChoiceQuestion | BlankQuestion | SubjectiveQuestion
+export type Question = ChoiceQuestion | ChoiceGroupQuestion | BlankQuestion | SubjectiveQuestion

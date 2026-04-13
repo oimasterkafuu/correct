@@ -1,5 +1,9 @@
 import { alphaLabel, countAreaTokens, countInlineTokens, migrateStemTokens } from './questionUtils'
-import type { Question } from '../types'
+import {
+  DEFAULT_PDF_EXPORT_SPACING_CONFIG,
+  type PdfExportSpacingConfig,
+} from './pdfExportConfig'
+import type { ChoiceSubQuestion, Question } from '../types'
 
 const INLINE_TOKEN_REGEX = /\[\[INLINE_BLANK_(\d+)\]\]/g
 const AREA_TOKEN_REGEX = /\[\[AREA_BLANK_(\d+)\]\]/g
@@ -221,6 +225,9 @@ function buildQuestionMarker(question: Question): string {
   }
   if (question.type === 'blank') {
     return '✧'
+  }
+  if (question.type === 'choiceGroup') {
+    return '✦'
   }
   return question.choiceMode === 'single' ? '✧' : '✦'
 }
@@ -530,8 +537,19 @@ function collectImageSources(questions: Question[], includeAnalysis: boolean): s
         consume(option)
       }
     }
+    if (question.type === 'choiceGroup') {
+      for (const subquestion of question.subquestions) {
+        consume(subquestion.stem)
+        for (const option of subquestion.options) {
+          consume(option)
+        }
+        if (includeAnalysis && subquestion.analysis.trim().length > 0) {
+          consume(subquestion.analysis)
+        }
+      }
+    }
 
-    if (includeAnalysis && question.analysis.trim().length > 0) {
+    if (question.type !== 'choiceGroup' && includeAnalysis && question.analysis.trim().length > 0) {
       consume(question.analysis)
     }
   }
@@ -583,8 +601,20 @@ function collectMathSources(
         consume(option)
       }
     }
+    if (question.type === 'choiceGroup') {
+      for (const subquestion of question.subquestions) {
+        consume(subquestion.stem)
+        consume(subquestion.normalizedStem)
+        for (const option of subquestion.options) {
+          consume(option)
+        }
+        if (includeAnalysis && subquestion.analysis.trim().length > 0) {
+          consume(subquestion.analysis)
+        }
+      }
+    }
 
-    if (includeAnalysis && question.analysis.trim().length > 0) {
+    if (question.type !== 'choiceGroup' && includeAnalysis && question.analysis.trim().length > 0) {
       consume(question.analysis)
     }
   }
@@ -1415,19 +1445,103 @@ function buildAnalysisBlocks(
   columnWidthPx: number,
   imageMap: Map<string, HTMLImageElement | null>,
   mathAssetMap: Map<string, MathAsset | null>,
+  spacingConfig: PdfExportSpacingConfig,
 ): RenderBlock[] {
   const normalized = analysisMarkdown.replace(/\r/g, '').trim()
   if (normalized.length === 0) {
     return []
   }
 
-  const nodes = buildAnalysisNodes(normalized)
-  nodes.push({
-    type: 'space',
-    heightMm: 5,
-  })
+  const nodes: RenderNode[] = [
+    {
+      type: 'space',
+      heightMm: spacingConfig.analysisTopGapMm,
+    },
+    ...buildAnalysisNodes(normalized),
+  ]
 
   return [makeBlock(measureCtx, nodes, columnWidthPx, imageMap, mathAssetMap)]
+}
+
+function appendAnalysisSpacing(nodes: RenderNode[], spacingConfig: PdfExportSpacingConfig) {
+  nodes.push({
+    type: 'space',
+    heightMm: spacingConfig.analysisTopGapMm,
+  })
+}
+
+function appendChoiceContentNodes(args: {
+  nodes: RenderNode[]
+  normalizedStem: string
+  optionCount: number
+  options: string[]
+  optionStyle: ChoiceSubQuestion['optionStyle']
+  spacingConfig: PdfExportSpacingConfig
+  questionMarker?: string
+  questionLabel?: string
+  includeTrailingSpace?: boolean
+}) {
+  const {
+    nodes,
+    normalizedStem,
+    optionCount,
+    options,
+    optionStyle,
+    spacingConfig,
+    questionMarker,
+    questionLabel,
+    includeTrailingSpace = true,
+  } = args
+
+  const stemMarkdown = normalizedStem.replace(INLINE_TOKEN_REGEX, CHOICE_BLANK_TEXT)
+  const stemSplit = splitMarkdownTextAndImages(stemMarkdown)
+  const rawStemNodes = stemSplit.textMarkdown.length > 0 ? markdownToNodes(stemSplit.textMarkdown) : []
+  const stemNodes = questionLabel
+    ? prependLabelToNodes(`${questionLabel} `, rawStemNodes, { bold: true })
+    : questionMarker
+      ? prependQuestionMarkerToNodes(questionMarker, rawStemNodes)
+      : rawStemNodes
+
+  nodes.push(...stemNodes)
+
+  if (stemSplit.images.length > 0) {
+    if (stemNodes.length > 0) {
+      nodes.push({
+        type: 'space',
+        heightMm: spacingConfig.choiceStemImageTopGapMm,
+      })
+    }
+    nodes.push(...buildChoiceLikeImageRows(stemSplit.images))
+    nodes.push({
+      type: 'space',
+      heightMm: spacingConfig.choiceStemImageBottomGapMm,
+    })
+  } else {
+    nodes.push({
+      type: 'space',
+      heightMm: spacingConfig.choiceStemGapMm,
+    })
+  }
+
+  const visibleOptions = options.slice(0, optionCount)
+  visibleOptions.forEach((option, index) => {
+    const marker = buildOptionMarker(index, optionStyle)
+    const optionNodes = prependLabelToNodes(`${marker}. `, markdownToNodes(option))
+    nodes.push(...optionNodes)
+    if (index < visibleOptions.length - 1) {
+      nodes.push({
+        type: 'space',
+        heightMm: spacingConfig.choiceOptionGapMm,
+      })
+    }
+  })
+
+  if (includeTrailingSpace) {
+    nodes.push({
+      type: 'space',
+      heightMm: spacingConfig.choiceAfterOptionsGapMm,
+    })
+  }
 }
 
 function buildChoicePlan(
@@ -1437,64 +1551,39 @@ function buildChoicePlan(
   imageMap: Map<string, HTMLImageElement | null>,
   mathAssetMap: Map<string, MathAsset | null>,
   includeAnalysis: boolean,
+  spacingConfig: PdfExportSpacingConfig,
 ): RenderPlan {
   const baseStem = migrateStemTokens(question.normalizedStem)
   const normalizedStem =
     countInlineTokens(baseStem) > 0 ? baseStem : `${baseStem.trimEnd()} [[INLINE_BLANK_1]]`.trim()
-  const stemMarkdown = normalizedStem.replace(INLINE_TOKEN_REGEX, CHOICE_BLANK_TEXT)
-  const stemSplit = splitMarkdownTextAndImages(stemMarkdown)
   const marker = buildQuestionMarker(question)
-  const rawStemNodes = stemSplit.textMarkdown.length > 0 ? markdownToNodes(stemSplit.textMarkdown) : []
-  const stemNodes = prependQuestionMarkerToNodes(marker, rawStemNodes)
-
-  const nodes: RenderNode[] = [...stemNodes]
-
-  if (stemSplit.images.length > 0) {
-    if (stemNodes.length > 0) {
-      nodes.push({
-        type: 'space',
-        heightMm: 5,
-      })
-    }
-    nodes.push(...buildChoiceLikeImageRows(stemSplit.images))
-    nodes.push({
-      type: 'space',
-      heightMm: 8,
-    })
-  } else {
-    nodes.push({
-      type: 'space',
-      heightMm: 10,
-    })
-  }
-
-  const options = question.options.slice(0, question.optionCount)
-  options.forEach((option, index) => {
-    const marker = buildOptionMarker(index, question.optionStyle)
-    const optionNodes = prependLabelToNodes(`${marker}. `, markdownToNodes(option))
-    nodes.push(...optionNodes)
-    if (index < options.length - 1) {
-      nodes.push({
-        type: 'space',
-        heightMm: 10,
-      })
-    }
-  })
-
-  nodes.push({
-    type: 'space',
-    heightMm: 30,
+  const nodes: RenderNode[] = []
+  appendChoiceContentNodes({
+    nodes,
+    normalizedStem,
+    optionCount: question.optionCount,
+    options: question.options,
+    optionStyle: question.optionStyle,
+    spacingConfig,
+    questionMarker: marker,
   })
 
   const coreBlock = makeBlock(measureCtx, nodes, columnWidthPx, imageMap, mathAssetMap)
   const analysisBlocks =
     includeAnalysis && question.analysis.trim().length > 0
-      ? buildAnalysisBlocks(question.analysis, measureCtx, columnWidthPx, imageMap, mathAssetMap)
+      ? buildAnalysisBlocks(
+          question.analysis,
+          measureCtx,
+          columnWidthPx,
+          imageMap,
+          mathAssetMap,
+          spacingConfig,
+        )
       : []
   const blocks = [coreBlock, ...analysisBlocks]
 
   return {
-    type: 'choice',
+    type: 'choiceGroup',
     blocks,
     totalHeightPx: blocks.reduce((sum, item) => sum + item.heightPx, 0),
   }
@@ -1507,12 +1596,15 @@ function buildBlankPlan(
   imageMap: Map<string, HTMLImageElement | null>,
   mathAssetMap: Map<string, MathAsset | null>,
   includeAnalysis: boolean,
+  spacingConfig: PdfExportSpacingConfig,
 ): RenderPlan {
   const baseStem = migrateStemTokens(question.normalizedStem)
   const normalizedStem =
     countInlineTokens(baseStem) > 0 ? baseStem : `${baseStem.trimEnd()} [[INLINE_BLANK_1]]`.trim()
   const blankCount = Math.max(1, question.blankCount)
-  const extraSpaceMm = 50 + Math.max(0, blankCount - 1) * 10
+  const extraSpaceMm =
+    spacingConfig.blankBaseAnswerSpaceMm +
+    Math.max(0, blankCount - 1) * spacingConfig.blankPerExtraAnswerSpaceMm
   const stemMarkdown = normalizedStem.replace(INLINE_TOKEN_REGEX, FILL_BLANK_TEXT)
   const stemSplit = splitMarkdownTextAndImages(stemMarkdown)
   const marker = buildQuestionMarker(question)
@@ -1525,13 +1617,13 @@ function buildBlankPlan(
     if (stemNodes.length > 0) {
       nodes.push({
         type: 'space',
-        heightMm: 5,
+        heightMm: spacingConfig.blankStemImageTopGapMm,
       })
     }
     nodes.push(...buildChoiceLikeImageRows(stemSplit.images))
     nodes.push({
       type: 'space',
-      heightMm: 8,
+      heightMm: spacingConfig.blankStemImageBottomGapMm,
     })
   }
 
@@ -1543,12 +1635,137 @@ function buildBlankPlan(
   const coreBlock = makeBlock(measureCtx, nodes, columnWidthPx, imageMap, mathAssetMap)
   const analysisBlocks =
     includeAnalysis && question.analysis.trim().length > 0
-      ? buildAnalysisBlocks(question.analysis, measureCtx, columnWidthPx, imageMap, mathAssetMap)
+      ? buildAnalysisBlocks(
+          question.analysis,
+          measureCtx,
+          columnWidthPx,
+          imageMap,
+          mathAssetMap,
+          spacingConfig,
+        )
       : []
   const blocks = [coreBlock, ...analysisBlocks]
 
   return {
     type: 'blank',
+    blocks,
+    totalHeightPx: blocks.reduce((sum, item) => sum + item.heightPx, 0),
+  }
+}
+
+function buildChoiceGroupAnalysisBlocks(
+  question: Extract<Question, { type: 'choiceGroup' }>,
+  measureCtx: CanvasRenderingContext2D,
+  columnWidthPx: number,
+  imageMap: Map<string, HTMLImageElement | null>,
+  mathAssetMap: Map<string, MathAsset | null>,
+  spacingConfig: PdfExportSpacingConfig,
+): RenderBlock[] {
+  const nodes: RenderNode[] = []
+
+  question.subquestions.forEach((subquestion, index) => {
+    const analysis = subquestion.analysis.trim()
+    if (analysis.length === 0) {
+      return
+    }
+
+    appendAnalysisSpacing(nodes, spacingConfig)
+    nodes.push(
+      ...prependLabelToNodes(`第${index + 1}题解析：`, buildAnalysisNodes(analysis), {
+        bold: true,
+        fontSize: ANALYSIS_FONT_SIZE,
+        fontFamily: ANALYSIS_FONT_FAMILY,
+        color: '#2f3a4c',
+      }),
+    )
+  })
+
+  if (nodes.length === 0) {
+    return []
+  }
+
+  return [makeBlock(measureCtx, nodes, columnWidthPx, imageMap, mathAssetMap)]
+}
+
+function buildChoiceGroupPlan(
+  question: Extract<Question, { type: 'choiceGroup' }>,
+  measureCtx: CanvasRenderingContext2D,
+  columnWidthPx: number,
+  imageMap: Map<string, HTMLImageElement | null>,
+  mathAssetMap: Map<string, MathAsset | null>,
+  includeAnalysis: boolean,
+  spacingConfig: PdfExportSpacingConfig,
+): RenderPlan {
+  const nodes: RenderNode[] = []
+  const materialMarker = buildQuestionMarker(question)
+  const materialSplit = splitMarkdownTextAndImages(question.normalizedStem || question.stem)
+  const rawMaterialNodes =
+    materialSplit.textMarkdown.length > 0 ? markdownToNodes(materialSplit.textMarkdown) : []
+  const materialNodes = prependQuestionMarkerToNodes(materialMarker, rawMaterialNodes)
+
+  nodes.push(...materialNodes)
+
+  if (materialSplit.images.length > 0) {
+    if (materialNodes.length > 0) {
+      nodes.push({
+        type: 'space',
+        heightMm: spacingConfig.choiceStemImageTopGapMm,
+      })
+    }
+    nodes.push(...buildChoiceLikeImageRows(materialSplit.images))
+  }
+
+  if (nodes.length > 0) {
+    nodes.push({
+      type: 'space',
+      heightMm: spacingConfig.choiceGroupMaterialGapMm,
+    })
+  }
+
+  question.subquestions.forEach((subquestion, index) => {
+    const baseStem = migrateStemTokens(subquestion.normalizedStem)
+    const normalizedStem =
+      countInlineTokens(baseStem) > 0 ? baseStem : `${baseStem.trimEnd()} [[INLINE_BLANK_1]]`.trim()
+
+    appendChoiceContentNodes({
+      nodes,
+      normalizedStem,
+      optionCount: subquestion.optionCount,
+      options: subquestion.options,
+      optionStyle: subquestion.optionStyle,
+      spacingConfig,
+      questionLabel: `${index + 1}.`,
+      includeTrailingSpace: false,
+    })
+
+    if (index < question.subquestions.length - 1) {
+      nodes.push({
+        type: 'space',
+        heightMm: spacingConfig.choiceGroupQuestionGapMm,
+      })
+    } else {
+      nodes.push({
+        type: 'space',
+        heightMm: spacingConfig.choiceAfterOptionsGapMm,
+      })
+    }
+  })
+
+  const coreBlock = makeBlock(measureCtx, nodes, columnWidthPx, imageMap, mathAssetMap)
+  const analysisBlocks = includeAnalysis
+    ? buildChoiceGroupAnalysisBlocks(
+        question,
+        measureCtx,
+        columnWidthPx,
+        imageMap,
+        mathAssetMap,
+        spacingConfig,
+      )
+    : []
+  const blocks = [coreBlock, ...analysisBlocks]
+
+  return {
+    type: 'choice',
     blocks,
     totalHeightPx: blocks.reduce((sum, item) => sum + item.heightPx, 0),
   }
@@ -1561,11 +1778,15 @@ function buildSubjectivePlan(
   imageMap: Map<string, HTMLImageElement | null>,
   mathAssetMap: Map<string, MathAsset | null>,
   includeAnalysis: boolean,
+  spacingConfig: PdfExportSpacingConfig,
 ): RenderPlan {
   const baseStem = question.normalizedStem
   const areaCount = Math.max(1, Math.max(question.areaCount, countAreaTokens(baseStem)))
   const splitted = splitSubjectiveStem(baseStem, areaCount)
-  const unitSpaceMm = question.subject === 'math' ? 70 : 50
+  const unitSpaceMm =
+    question.subject === 'math'
+      ? spacingConfig.subjectiveMathAnswerSpaceMm
+      : spacingConfig.subjectiveAnswerSpaceMm
   const marker = buildQuestionMarker(question)
 
   const blocks: RenderBlock[] = []
@@ -1601,7 +1822,7 @@ function buildSubjectivePlan(
   const trailingAnswerSpaceNodes: RenderNode[] = [
     {
       type: 'space',
-      heightMm: 50,
+      heightMm: spacingConfig.subjectiveAfterAnswerSpaceMm,
     },
   ]
   blocks.push(makeBlock(measureCtx, trailingAnswerSpaceNodes, columnWidthPx, imageMap, mathAssetMap))
@@ -1614,6 +1835,7 @@ function buildSubjectivePlan(
         columnWidthPx,
         imageMap,
         mathAssetMap,
+        spacingConfig,
       ),
     )
   }
@@ -1663,6 +1885,7 @@ export async function exportQuestionsAsPdf(
   questions: Question[],
   options?: {
     includeAnalysis?: boolean
+    spacingConfig?: PdfExportSpacingConfig
   },
 ): Promise<{
   ok: boolean
@@ -1701,6 +1924,7 @@ export async function exportQuestionsAsPdf(
   }
 
   const includeAnalysis = options?.includeAnalysis === true
+  const spacingConfig = options?.spacingConfig ?? DEFAULT_PDF_EXPORT_SPACING_CONFIG
   const [imageMap, mathAssetMap] = await Promise.all([
     buildImageMap(questions, includeAnalysis),
     buildMathAssetMap(questions, includeAnalysis),
@@ -1715,6 +1939,18 @@ export async function exportQuestionsAsPdf(
         imageMap,
         mathAssetMap,
         includeAnalysis,
+        spacingConfig,
+      )
+    }
+    if (question.type === 'choiceGroup') {
+      return buildChoiceGroupPlan(
+        question,
+        measureCtx,
+        columnWidthPx,
+        imageMap,
+        mathAssetMap,
+        includeAnalysis,
+        spacingConfig,
       )
     }
     if (question.type === 'blank') {
@@ -1725,6 +1961,7 @@ export async function exportQuestionsAsPdf(
         imageMap,
         mathAssetMap,
         includeAnalysis,
+        spacingConfig,
       )
     }
     return buildSubjectivePlan(
@@ -1734,6 +1971,7 @@ export async function exportQuestionsAsPdf(
       imageMap,
       mathAssetMap,
       includeAnalysis,
+      spacingConfig,
     )
   })
 
@@ -1980,7 +2218,7 @@ export async function exportQuestionsAsPdf(
     return false
   }
 
-  const drawChoiceOrBlankPlan = (plan: RenderPlan) => {
+  const drawChoiceLikePlan = (plan: RenderPlan) => {
     if (plan.blocks.length === 0) {
       return
     }
@@ -2043,8 +2281,8 @@ export async function exportQuestionsAsPdf(
   for (const plan of sortedPlans) {
     if (plan.type === 'subjective') {
       drawSubjectivePlan(plan)
-    } else if (plan.type === 'choice' || plan.type === 'blank') {
-      drawChoiceOrBlankPlan(plan)
+    } else if (plan.type === 'choice' || plan.type === 'choiceGroup' || plan.type === 'blank') {
+      drawChoiceLikePlan(plan)
     } else {
       drawSimplePlan(plan)
     }
