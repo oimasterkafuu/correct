@@ -4,6 +4,11 @@ import {
   type PdfExportSpacingConfig,
 } from './pdfExportConfig'
 import type { ChoiceSubQuestion, Question } from '../types'
+import { unified } from 'unified'
+import remarkParse from 'remark-parse'
+import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import { toMarkdown } from 'mdast-util-to-markdown'
 
 const INLINE_TOKEN_REGEX = /\[\[INLINE_BLANK_(\d+)\]\]/g
 const AREA_TOKEN_REGEX = /\[\[AREA_BLANK_(\d+)\]\]/g
@@ -11,6 +16,15 @@ const MARKDOWN_IMAGE_REGEX = /!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)/g
 
 const CHOICE_BLANK_TEXT = '（    ）'
 const FILL_BLANK_TEXT = '__________'
+const CORRECT_OPTION_COLOR = '#2f5d50'
+const TABLE_BORDER_COLOR = '#aab5c3'
+const TABLE_HEADER_FILL_COLOR = '#eef3f8'
+const TABLE_CELL_HORIZONTAL_PADDING_PX = mmToPx(1.4)
+const TABLE_CELL_VERTICAL_PADDING_PX = mmToPx(0.9)
+const TABLE_MIN_COLUMN_WIDTH_PX = mmToPx(14)
+const BLOCKQUOTE_MARKER = '▍ '
+const CODE_FONT_FAMILY =
+  '"SFMono-Regular", "Consolas", "Liberation Mono", "Menlo", monospace'
 
 const PAGE_WIDTH_MM = 182
 const PAGE_HEIGHT_MM = 257
@@ -59,12 +73,29 @@ type RenderNode =
       color?: string
     }
   | {
+      type: 'richText'
+      segments: RichTextSegment[]
+      fontSize: number
+      bold?: boolean
+      fontFamily?: string
+      color?: string
+    }
+  | {
       type: 'richTextLines'
       lines: RichTextLine[]
       fontSize: number
       bold?: boolean
       fontFamily?: string
       color?: string
+    }
+  | {
+      type: 'table'
+      rows: RenderTableRow[]
+      fontSize: number
+      bold?: boolean
+      fontFamily?: string
+      color?: string
+      headerRowCount: number
     }
   | {
       type: 'image'
@@ -163,14 +194,39 @@ interface RenderTextToken {
   text: string
   width: number
   height: number
+  fontWeight: number
+  fontFamily: string
+  color: string
 }
 
 type RenderInlineToken = RenderMathToken | RenderTextToken
+type RenderInlineNode = RenderInlineToken | { type: 'lineBreak' }
 
 interface RichTextLine {
   tokens: RenderInlineToken[]
   width: number
   height: number
+}
+
+type RichTextSegment =
+  | {
+      type: 'text'
+      text: string
+      bold?: boolean
+      fontFamily?: string
+      color?: string
+    }
+  | {
+      type: 'math'
+      latex: string
+      displayMode: boolean
+    }
+  | {
+      type: 'lineBreak'
+    }
+
+interface RenderTableRow {
+  cells: RichTextSegment[][]
 }
 
 function trimCanvasTransparentPadding(canvas: HTMLCanvasElement): HTMLCanvasElement {
@@ -342,6 +398,444 @@ function normalizeMarkdownText(markdown: string): string {
     .trim()
 }
 
+function pushTextSegment(
+  target: RichTextSegment[],
+  text: string,
+  style: {
+    bold?: boolean
+    fontFamily?: string
+    color?: string
+  },
+) {
+  if (text.length === 0) {
+    return
+  }
+
+  const last = target[target.length - 1]
+  if (
+    last?.type === 'text' &&
+    last.bold === style.bold &&
+    last.fontFamily === style.fontFamily &&
+    last.color === style.color
+  ) {
+    last.text += text
+    return
+  }
+
+  target.push({
+    type: 'text',
+    text,
+    bold: style.bold,
+    fontFamily: style.fontFamily,
+    color: style.color,
+  })
+}
+
+function pushLineBreakSegment(target: RichTextSegment[]) {
+  const last = target[target.length - 1]
+  if (last?.type === 'lineBreak') {
+    return
+  }
+  target.push({ type: 'lineBreak' })
+}
+
+function compactRichTextSegments(segments: RichTextSegment[]): RichTextSegment[] {
+  const result: RichTextSegment[] = []
+
+  segments.forEach((segment) => {
+    if (segment.type === 'lineBreak') {
+      pushLineBreakSegment(result)
+      return
+    }
+
+    if (segment.type === 'math') {
+      result.push(segment)
+      return
+    }
+
+    pushTextSegment(result, segment.text, {
+      bold: segment.bold,
+      fontFamily: segment.fontFamily,
+      color: segment.color,
+    })
+  })
+
+  while (result[0]?.type === 'lineBreak') {
+    result.shift()
+  }
+  while (result[result.length - 1]?.type === 'lineBreak') {
+    result.pop()
+  }
+
+  return result
+}
+
+function extractInlineSegments(
+  nodes: Array<Record<string, unknown>>,
+  style: {
+    bold?: boolean
+    fontFamily?: string
+    color?: string
+  } = {},
+): RichTextSegment[] {
+  const segments: RichTextSegment[] = []
+
+  const visitNode = (
+    node: Record<string, unknown>,
+    inheritedStyle: {
+      bold?: boolean
+      fontFamily?: string
+      color?: string
+    },
+  ) => {
+    const nodeType = typeof node.type === 'string' ? node.type : ''
+
+    if (nodeType === 'text') {
+      pushTextSegment(segments, typeof node.value === 'string' ? node.value : '', inheritedStyle)
+      return
+    }
+
+    if (nodeType === 'strong') {
+      const children = Array.isArray(node.children) ? (node.children as Array<Record<string, unknown>>) : []
+      children.forEach((child) => visitNode(child, { ...inheritedStyle, bold: true }))
+      return
+    }
+
+    if (
+      nodeType === 'emphasis' ||
+      nodeType === 'delete' ||
+      nodeType === 'link' ||
+      nodeType === 'linkReference'
+    ) {
+      const children = Array.isArray(node.children) ? (node.children as Array<Record<string, unknown>>) : []
+      children.forEach((child) => visitNode(child, inheritedStyle))
+      return
+    }
+
+    if (nodeType === 'inlineCode') {
+      pushTextSegment(segments, typeof node.value === 'string' ? node.value : '', {
+        ...inheritedStyle,
+        fontFamily: CODE_FONT_FAMILY,
+      })
+      return
+    }
+
+    if (nodeType === 'inlineMath') {
+      const latex = typeof node.value === 'string' ? node.value.trim() : ''
+      if (latex.length > 0) {
+        segments.push({
+          type: 'math',
+          latex,
+          displayMode: false,
+        })
+      }
+      return
+    }
+
+    if (nodeType === 'break') {
+      pushLineBreakSegment(segments)
+      return
+    }
+
+    if (nodeType === 'image') {
+      const alt = typeof node.alt === 'string' && node.alt.trim().length > 0 ? node.alt.trim() : '图片'
+      pushTextSegment(segments, alt, inheritedStyle)
+      return
+    }
+
+    if (Array.isArray(node.children)) {
+      ;(node.children as Array<Record<string, unknown>>).forEach((child) => visitNode(child, inheritedStyle))
+      return
+    }
+
+    if (typeof node.value === 'string') {
+      pushTextSegment(segments, normalizeMarkdownText(node.value), inheritedStyle)
+    }
+  }
+
+  nodes.forEach((node) => visitNode(node, style))
+  return compactRichTextSegments(segments)
+}
+
+function buildRichTextNode(
+  segments: RichTextSegment[],
+  textStyle: Required<TextNodeStyle>,
+): RenderNode[] {
+  const compacted = compactRichTextSegments(segments)
+  if (compacted.length === 0) {
+    return []
+  }
+
+  return [
+    {
+      type: 'richText',
+      segments: compacted,
+      fontSize: textStyle.fontSize,
+      bold: textStyle.bold,
+      fontFamily: textStyle.fontFamily,
+      color: textStyle.color,
+    },
+  ]
+}
+
+function isWhitespaceOnlyMdastNode(node: Record<string, unknown>): boolean {
+  return node.type === 'text' && typeof node.value === 'string' && node.value.trim().length === 0
+}
+
+function extractParagraphImages(node: Record<string, unknown>): Array<{ src: string; alt: string }> | null {
+  if (node.type !== 'paragraph' || !Array.isArray(node.children)) {
+    return null
+  }
+
+  const images: Array<{ src: string; alt: string }> = []
+
+  for (const child of node.children as Array<Record<string, unknown>>) {
+    if (child.type === 'image') {
+      const url = typeof child.url === 'string' ? child.url : ''
+      if (url.trim().length === 0) {
+        return null
+      }
+      images.push({
+        src: resolveImageUrl(url),
+        alt: typeof child.alt === 'string' && child.alt.trim().length > 0 ? child.alt.trim() : '图片',
+      })
+      continue
+    }
+
+    if (!isWhitespaceOnlyMdastNode(child)) {
+      return null
+    }
+  }
+
+  return images.length > 0 ? images : null
+}
+
+function listItemToSegments(
+  node: Record<string, unknown>,
+  marker: string,
+): RichTextSegment[] {
+  const segments: RichTextSegment[] = []
+  pushTextSegment(segments, marker, { bold: true })
+
+  const children = Array.isArray(node.children) ? (node.children as Array<Record<string, unknown>>) : []
+  let hasContent = false
+
+  children.forEach((child, index) => {
+    if (index > 0 && segments[segments.length - 1]?.type !== 'lineBreak') {
+      pushLineBreakSegment(segments)
+    }
+
+    if (child.type === 'paragraph' && Array.isArray(child.children)) {
+      segments.push(...extractInlineSegments(child.children as Array<Record<string, unknown>>))
+      hasContent = true
+      return
+    }
+
+    if (child.type === 'math' && typeof child.value === 'string' && child.value.trim().length > 0) {
+      segments.push({
+        type: 'math',
+        latex: child.value.trim(),
+        displayMode: true,
+      })
+      hasContent = true
+      return
+    }
+
+    const fallback = normalizeMarkdownText(toMarkdown(child as never))
+    if (fallback.length > 0) {
+      pushTextSegment(segments, fallback, {})
+      hasContent = true
+    }
+  })
+
+  return hasContent ? compactRichTextSegments(segments) : []
+}
+
+function parseMarkdownTextToNodes(markdown: string, textStyle: Required<TextNodeStyle>): RenderNode[] {
+  const normalized = normalizeMathDelimiters(markdown).replace(/\r/g, '').trim()
+  if (normalized.length === 0) {
+    return []
+  }
+
+  let tree: { children?: Array<Record<string, unknown>> } | null = null
+  try {
+    tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).parse(normalized) as unknown as {
+      children?: Array<Record<string, unknown>>
+    }
+  } catch {
+    tree = null
+  }
+
+  if (!tree?.children) {
+    return buildRichTextNode(
+      [
+        {
+          type: 'text',
+          text: normalizeMarkdownText(normalized),
+        },
+      ],
+      textStyle,
+    )
+  }
+
+  const nodes: RenderNode[] = []
+
+  tree.children.forEach((child) => {
+    const images = extractParagraphImages(child)
+    if (images) {
+      if (images.length === 1) {
+        nodes.push({
+          type: 'image',
+          src: images[0].src,
+          alt: images[0].alt,
+        })
+      } else {
+        nodes.push({
+          type: 'imageRow',
+          images,
+        })
+      }
+      return
+    }
+
+    if (child.type === 'paragraph') {
+      const paragraphChildren = Array.isArray(child.children)
+        ? (child.children as Array<Record<string, unknown>>)
+        : []
+      nodes.push(...buildRichTextNode(extractInlineSegments(paragraphChildren), textStyle))
+      return
+    }
+
+    if (child.type === 'heading') {
+      const headingChildren = Array.isArray(child.children)
+        ? (child.children as Array<Record<string, unknown>>)
+        : []
+      nodes.push(
+        ...buildRichTextNode(extractInlineSegments(headingChildren, { bold: true }), {
+          ...textStyle,
+          fontSize: textStyle.fontSize * 1.06,
+          bold: true,
+        }),
+      )
+      return
+    }
+
+    if (child.type === 'list') {
+      const start = typeof child.start === 'number' ? child.start : 1
+      const ordered = child.ordered === true
+      const items = Array.isArray(child.children) ? (child.children as Array<Record<string, unknown>>) : []
+      items.forEach((item, index) => {
+        const marker = ordered ? `${start + index}. ` : '• '
+        nodes.push(...buildRichTextNode(listItemToSegments(item, marker), textStyle))
+      })
+      return
+    }
+
+    if (child.type === 'blockquote') {
+      const quoteChildren = Array.isArray(child.children) ? (child.children as Array<Record<string, unknown>>) : []
+      quoteChildren.forEach((quoteChild, index) => {
+        const quoteMarkdown = normalizeMarkdownText(toMarkdown(quoteChild as never))
+        if (quoteMarkdown.length === 0) {
+          return
+        }
+        const segments: RichTextSegment[] = []
+        pushTextSegment(segments, index === 0 ? BLOCKQUOTE_MARKER : '  ', {
+          bold: true,
+          color: textStyle.color,
+        })
+        pushTextSegment(segments, quoteMarkdown, {})
+        nodes.push(...buildRichTextNode(segments, textStyle))
+      })
+      return
+    }
+
+    if (child.type === 'code') {
+      const value = typeof child.value === 'string' ? child.value : ''
+      nodes.push(
+        ...buildRichTextNode(
+          [
+            {
+              type: 'text',
+              text: value,
+              fontFamily: CODE_FONT_FAMILY,
+            },
+          ],
+          textStyle,
+        ),
+      )
+      return
+    }
+
+    if (child.type === 'math') {
+      const latex = typeof child.value === 'string' ? child.value.trim() : ''
+      if (latex.length > 0) {
+        nodes.push(
+          ...buildRichTextNode(
+            [
+              {
+                type: 'math',
+                latex,
+                displayMode: true,
+              },
+            ],
+            textStyle,
+          ),
+        )
+      }
+      return
+    }
+
+    if (child.type === 'table') {
+      const rows = Array.isArray(child.children) ? (child.children as Array<Record<string, unknown>>) : []
+      const tableRows: RenderTableRow[] = rows
+        .map((row, rowIndex) => {
+          const cells = Array.isArray(row.children) ? (row.children as Array<Record<string, unknown>>) : []
+          return {
+            cells: cells.map((cell) =>
+              extractInlineSegments(
+                Array.isArray(cell.children) ? (cell.children as Array<Record<string, unknown>>) : [],
+                {
+                  bold: rowIndex === 0,
+                },
+              ),
+            ),
+          }
+        })
+        .filter((row) => row.cells.length > 0)
+
+      if (tableRows.length > 0) {
+        nodes.push({
+          type: 'table',
+          rows: tableRows,
+          headerRowCount: 1,
+          fontSize: textStyle.fontSize,
+          bold: textStyle.bold,
+          fontFamily: textStyle.fontFamily,
+          color: textStyle.color,
+        })
+      }
+      return
+    }
+
+    const fallback = normalizeMarkdownText(toMarkdown(child as never))
+    if (fallback.length > 0) {
+      nodes.push(
+        ...buildRichTextNode(
+          [
+            {
+              type: 'text',
+              text: fallback,
+            },
+          ],
+          textStyle,
+        ),
+      )
+    }
+  })
+
+  return nodes
+}
+
 function resolveImageUrl(src: string): string {
   const raw = src.trim()
   if (raw.startsWith('data:') || raw.startsWith('blob:')) return raw
@@ -403,11 +897,17 @@ function buildChoiceLikeImageRows(
 }
 
 function prependQuestionMarkerToNodes(marker: string, nodes: RenderNode[]): RenderNode[] {
+  const markerSegment: RichTextSegment = {
+    type: 'text',
+    text: `${marker} `,
+    bold: true,
+  }
+
   if (nodes.length === 0) {
     return [
       {
-        type: 'text',
-        text: `${marker} `,
+        type: 'richText',
+        segments: [markerSegment],
         fontSize: BASE_FONT_SIZE,
         fontFamily: QUESTION_FONT_FAMILY,
         color: '#1e2430',
@@ -430,10 +930,20 @@ function prependQuestionMarkerToNodes(marker: string, nodes: RenderNode[]): Rend
     ]
   }
 
+  if (first.type === 'richText') {
+    return [
+      {
+        ...first,
+        segments: compactRichTextSegments([markerSegment, ...first.segments]),
+      },
+      ...nodes.slice(1),
+    ]
+  }
+
   return [
     {
-      type: 'text',
-      text: `${marker} `,
+      type: 'richText',
+      segments: [markerSegment],
       fontSize: BASE_FONT_SIZE,
       fontFamily: QUESTION_FONT_FAMILY,
       color: '#1e2430',
@@ -454,17 +964,7 @@ function markdownToNodes(markdown: string, textStyle?: TextNodeStyle): RenderNod
 
   for (const match of markdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
     const index = match.index ?? 0
-    const before = normalizeMarkdownText(markdown.slice(cursor, index))
-    if (before.length > 0) {
-      nodes.push({
-        type: 'text',
-        text: before,
-        fontSize: resolvedStyle.fontSize,
-        bold: resolvedStyle.bold,
-        fontFamily: resolvedStyle.fontFamily,
-        color: resolvedStyle.color,
-      })
-    }
+    nodes.push(...parseMarkdownTextToNodes(markdown.slice(cursor, index), resolvedStyle))
 
     nodes.push({
       type: 'image',
@@ -474,17 +974,7 @@ function markdownToNodes(markdown: string, textStyle?: TextNodeStyle): RenderNod
     cursor = index + match[0].length
   }
 
-  const tail = normalizeMarkdownText(markdown.slice(cursor))
-  if (tail.length > 0) {
-    nodes.push({
-      type: 'text',
-      text: tail,
-      fontSize: resolvedStyle.fontSize,
-      bold: resolvedStyle.bold,
-      fontFamily: resolvedStyle.fontFamily,
-      color: resolvedStyle.color,
-    })
-  }
+  nodes.push(...parseMarkdownTextToNodes(markdown.slice(cursor), resolvedStyle))
 
   return nodes
 }
@@ -496,12 +986,19 @@ function prependLabelToNodes(label: string, nodes: RenderNode[], textStyle?: Tex
     fontFamily: textStyle?.fontFamily ?? QUESTION_FONT_FAMILY,
     color: textStyle?.color ?? '#1e2430',
   }
+  const labelSegment: RichTextSegment = {
+    type: 'text',
+    text: label,
+    bold: resolvedStyle.bold,
+    fontFamily: resolvedStyle.fontFamily,
+    color: resolvedStyle.color,
+  }
 
   if (nodes.length === 0) {
     return [
       {
-        type: 'text',
-        text: label,
+        type: 'richText',
+        segments: [labelSegment],
         fontSize: resolvedStyle.fontSize,
         bold: resolvedStyle.bold,
         fontFamily: resolvedStyle.fontFamily,
@@ -521,10 +1018,20 @@ function prependLabelToNodes(label: string, nodes: RenderNode[], textStyle?: Tex
     ]
   }
 
+  if (first.type === 'richText') {
+    return [
+      {
+        ...first,
+        segments: compactRichTextSegments([labelSegment, ...first.segments]),
+      },
+      ...nodes.slice(1),
+    ]
+  }
+
   return [
     {
-      type: 'text',
-      text: label,
+      type: 'richText',
+      segments: [labelSegment],
       fontSize: resolvedStyle.fontSize,
       bold: resolvedStyle.bold,
       fontFamily: resolvedStyle.fontFamily,
@@ -836,10 +1343,8 @@ function getMathTokenSize(
   }
 }
 
-function compactLineBreakTokens(
-  tokens: Array<RenderInlineToken | { type: 'lineBreak' }>,
-): Array<RenderInlineToken | { type: 'lineBreak' }> {
-  const result: Array<RenderInlineToken | { type: 'lineBreak' }> = []
+function compactLineBreakTokens(tokens: RenderInlineNode[]): RenderInlineNode[] {
+  const result: RenderInlineNode[] = []
 
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i]
@@ -869,35 +1374,30 @@ function compactLineBreakTokens(
   return result
 }
 
-function tokenizeRichText(
+function segmentsFromPlainText(
   text: string,
-  ctx: CanvasRenderingContext2D,
-  fontSize: number,
-  maxWidth: number,
-  mathAssetMap: Map<string, MathAsset | null>,
-): Array<RenderInlineToken | { type: 'lineBreak' }> {
+  style: {
+    bold?: boolean
+    fontFamily?: string
+    color?: string
+  } = {},
+): RichTextSegment[] {
   const normalized = normalizeMathDelimiters(text)
-  const chunks: Array<
-    | { type: 'text'; text: string }
-    | { type: 'math'; latex: string; displayMode: boolean }
-  > = []
+  const segments: RichTextSegment[] = []
   const mathRegex = /(\$\$[\s\S]*?\$\$|\$[^$\n]+?\$)/g
   let cursor = 0
 
   for (const match of normalized.matchAll(mathRegex)) {
     const index = match.index ?? 0
     if (index > cursor) {
-      chunks.push({
-        type: 'text',
-        text: normalized.slice(cursor, index),
-      })
+      pushTextSegment(segments, normalized.slice(cursor, index), style)
     }
 
     const token = match[0]
     if (token.startsWith('$$')) {
       const latex = token.slice(2, -2).trim()
       if (latex.length > 0) {
-        chunks.push({
+        segments.push({
           type: 'math',
           latex,
           displayMode: true,
@@ -906,7 +1406,7 @@ function tokenizeRichText(
     } else {
       const latex = token.slice(1, -1).trim()
       if (latex.length > 0) {
-        chunks.push({
+        segments.push({
           type: 'math',
           latex,
           displayMode: false,
@@ -918,49 +1418,95 @@ function tokenizeRichText(
   }
 
   if (cursor < normalized.length) {
-    chunks.push({
-      type: 'text',
-      text: normalized.slice(cursor),
-    })
+    pushTextSegment(segments, normalized.slice(cursor), style)
   }
 
-  const tokens: Array<RenderInlineToken | { type: 'lineBreak' }> = []
+  return compactRichTextSegments(segments)
+}
 
-  for (const chunk of chunks) {
-    if (chunk.type === 'text') {
-      const parts = chunk.text.split('\n')
-      parts.forEach((part, index) => {
-        if (part.length > 0) {
-          for (const char of part) {
-            tokens.push({
-              type: 'text',
-              text: char,
-              width: ctx.measureText(char).width,
-              height: fontSize * LINE_HEIGHT_RATIO,
-            })
-          }
-        }
-        if (index < parts.length - 1) {
-          tokens.push({ type: 'lineBreak' })
-        }
+function tokenizeRichTextSegments(args: {
+  segments: RichTextSegment[]
+  ctx: CanvasRenderingContext2D
+  fontSize: number
+  maxWidth: number
+  bold?: boolean
+  fontFamily?: string
+  color?: string
+  mathAssetMap: Map<string, MathAsset | null>
+}): RenderInlineNode[] {
+  const { segments, ctx, fontSize, maxWidth, bold, fontFamily, color, mathAssetMap } = args
+  const tokens: RenderInlineNode[] = []
+
+  for (const segment of segments) {
+    if (segment.type === 'lineBreak') {
+      tokens.push({ type: 'lineBreak' })
+      continue
+    }
+
+    if (segment.type === 'math') {
+      const key = getMathKey(segment.latex, segment.displayMode)
+      const asset = mathAssetMap.get(key) ?? null
+      const size = getMathTokenSize(asset, segment.latex, ctx, fontSize, maxWidth, segment.displayMode)
+      tokens.push({
+        type: 'math',
+        key,
+        displayMode: segment.displayMode,
+        width: size.width,
+        height: size.height,
+        latex: segment.latex,
       })
       continue
     }
 
-    const key = getMathKey(chunk.latex, chunk.displayMode)
-    const asset = mathAssetMap.get(key) ?? null
-    const size = getMathTokenSize(asset, chunk.latex, ctx, fontSize, maxWidth, chunk.displayMode)
-    tokens.push({
-      type: 'math',
-      key,
-      displayMode: chunk.displayMode,
-      width: size.width,
-      height: size.height,
-      latex: chunk.latex,
+    const resolvedFontWeight = segment.bold || bold ? 700 : 400
+    const resolvedFontFamily = segment.fontFamily ?? fontFamily ?? QUESTION_FONT_FAMILY
+    const resolvedColor = segment.color ?? color ?? '#1e2430'
+    ctx.font = `${resolvedFontWeight} ${fontSize}px ${resolvedFontFamily}`
+
+    const parts = segment.text.split('\n')
+    parts.forEach((part, index) => {
+      if (part.length > 0) {
+        for (const char of part) {
+          tokens.push({
+            type: 'text',
+            text: char,
+            width: ctx.measureText(char).width,
+            height: fontSize * LINE_HEIGHT_RATIO,
+            fontWeight: resolvedFontWeight,
+            fontFamily: resolvedFontFamily,
+            color: resolvedColor,
+          })
+        }
+      }
+      if (index < parts.length - 1) {
+        tokens.push({ type: 'lineBreak' })
+      }
     })
   }
 
   return compactLineBreakTokens(tokens)
+}
+
+function tokenizeRichText(
+  text: string,
+  ctx: CanvasRenderingContext2D,
+  fontSize: number,
+  maxWidth: number,
+  bold: boolean | undefined,
+  fontFamily: string | undefined,
+  color: string | undefined,
+  mathAssetMap: Map<string, MathAsset | null>,
+): RenderInlineNode[] {
+  return tokenizeRichTextSegments({
+    segments: segmentsFromPlainText(text, { bold, fontFamily, color }),
+    ctx,
+    fontSize,
+    maxWidth,
+    bold,
+    fontFamily,
+    color,
+    mathAssetMap,
+  })
 }
 
 function layoutRichTextLines(args: {
@@ -968,10 +1514,45 @@ function layoutRichTextLines(args: {
   ctx: CanvasRenderingContext2D
   fontSize: number
   maxWidth: number
+  bold?: boolean
+  fontFamily?: string
+  color?: string
   mathAssetMap: Map<string, MathAsset | null>
 }): RichTextLine[] {
-  const { text, ctx, fontSize, maxWidth, mathAssetMap } = args
-  const tokens = tokenizeRichText(text, ctx, fontSize, maxWidth, mathAssetMap)
+  const { text, ctx, fontSize, maxWidth, bold, fontFamily, color, mathAssetMap } = args
+  const tokens = tokenizeRichText(text, ctx, fontSize, maxWidth, bold, fontFamily, color, mathAssetMap)
+  return layoutTokenLines(tokens, fontSize, maxWidth)
+}
+
+function layoutRichTextSegmentLines(args: {
+  segments: RichTextSegment[]
+  ctx: CanvasRenderingContext2D
+  fontSize: number
+  maxWidth: number
+  bold?: boolean
+  fontFamily?: string
+  color?: string
+  mathAssetMap: Map<string, MathAsset | null>
+}): RichTextLine[] {
+  const { segments, ctx, fontSize, maxWidth, bold, fontFamily, color, mathAssetMap } = args
+  const tokens = tokenizeRichTextSegments({
+    segments,
+    ctx,
+    fontSize,
+    maxWidth,
+    bold,
+    fontFamily,
+    color,
+    mathAssetMap,
+  })
+  return layoutTokenLines(tokens, fontSize, maxWidth)
+}
+
+function layoutTokenLines(
+  tokens: RenderInlineNode[],
+  fontSize: number,
+  maxWidth: number,
+): RichTextLine[] {
   const lines: RichTextLine[] = []
   const defaultHeight = fontSize * LINE_HEIGHT_RATIO
   let currentTokens: RenderInlineToken[] = []
@@ -1054,15 +1635,31 @@ function layoutRichTextLines(args: {
 }
 
 function layoutRichTextLinesWithFirstLineOffset(args: {
-  text: string
+  text?: string
+  segments?: RichTextSegment[]
   ctx: CanvasRenderingContext2D
   fontSize: number
   maxWidth: number
   firstLineOffset: number
+  bold?: boolean
+  fontFamily?: string
+  color?: string
   mathAssetMap: Map<string, MathAsset | null>
 }): RichTextLine[] {
-  const { text, ctx, fontSize, maxWidth, firstLineOffset, mathAssetMap } = args
-  const tokens = tokenizeRichText(text, ctx, fontSize, maxWidth, mathAssetMap)
+  const { text, segments, ctx, fontSize, maxWidth, firstLineOffset, bold, fontFamily, color, mathAssetMap } = args
+  const tokens =
+    segments
+      ? tokenizeRichTextSegments({
+          segments,
+          ctx,
+          fontSize,
+          maxWidth,
+          bold,
+          fontFamily,
+          color,
+          mathAssetMap,
+        })
+      : tokenizeRichText(text ?? '', ctx, fontSize, maxWidth, bold, fontFamily, color, mathAssetMap)
   const lines: RichTextLine[] = []
   const defaultHeight = fontSize * LINE_HEIGHT_RATIO
   let currentTokens: RenderInlineToken[] = []
@@ -1231,6 +1828,71 @@ function measureRichTextLinesHeight(lines: RichTextLine[]): number {
   return lines.reduce((sum, line) => sum + line.height, 0)
 }
 
+interface TableLayoutCell {
+  lines: RichTextLine[]
+}
+
+interface TableLayoutRow {
+  cells: TableLayoutCell[]
+  height: number
+}
+
+interface TableLayout {
+  columnWidths: number[]
+  rows: TableLayoutRow[]
+  totalHeight: number
+}
+
+function resolveTableNodeLayout(args: {
+  ctx: CanvasRenderingContext2D
+  node: Extract<RenderNode, { type: 'table' }>
+  widthPx: number
+  mathAssetMap: Map<string, MathAsset | null>
+}): TableLayout {
+  const { ctx, node, widthPx, mathAssetMap } = args
+  const columnCount = Math.max(1, ...node.rows.map((row) => row.cells.length))
+  const equalWidth = Math.max(TABLE_MIN_COLUMN_WIDTH_PX, widthPx / columnCount)
+  const scaledWidth =
+    equalWidth * columnCount > widthPx ? widthPx / columnCount : equalWidth
+  const columnWidths = Array.from({ length: columnCount }, () => scaledWidth)
+
+  const rows = node.rows.map((row) => {
+    const cells = row.cells.map((cellSegments) => {
+      const innerWidth = Math.max(10, scaledWidth - TABLE_CELL_HORIZONTAL_PADDING_PX * 2)
+      return {
+        lines: layoutRichTextSegmentLines({
+          segments: cellSegments,
+          ctx,
+          fontSize: node.fontSize,
+          maxWidth: innerWidth,
+          bold: node.bold,
+          fontFamily: node.fontFamily,
+          color: node.color,
+          mathAssetMap,
+        }),
+      }
+    })
+
+    const height =
+      Math.max(
+        node.fontSize * LINE_HEIGHT_RATIO,
+        ...cells.map((cell) => measureRichTextLinesHeight(cell.lines)),
+      ) +
+      TABLE_CELL_VERTICAL_PADDING_PX * 2
+
+    return {
+      cells,
+      height,
+    }
+  })
+
+  return {
+    columnWidths,
+    rows,
+    totalHeight: rows.reduce((sum, row) => sum + row.height, 0),
+  }
+}
+
 function drawRichTextLines(args: {
   ctx: CanvasRenderingContext2D
   lines: RichTextLine[]
@@ -1265,8 +1927,6 @@ function drawRichTextLines(args: {
 
   const previousBaseline = ctx.textBaseline
   ctx.textBaseline = 'top'
-  ctx.fillStyle = color
-  ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`
 
   for (const line of lines) {
     let cursorX = x
@@ -1279,14 +1939,45 @@ function drawRichTextLines(args: {
       cursorX = x + Math.max(0, (maxWidth - line.width) / 2)
     }
 
+    let textRun = ''
+    let runFontWeight = fontWeight
+    let runFontFamily = fontFamily
+    let runColor = color
+
+    const flushTextRun = () => {
+      if (textRun.length === 0) {
+        return
+      }
+      ctx.font = `${runFontWeight} ${fontSize}px ${runFontFamily}`
+      ctx.fillStyle = runColor
+      const textTopOffset = (line.height - fontSize * LINE_HEIGHT_RATIO) / 2
+      ctx.fillText(textRun, cursorX, y + textTopOffset)
+      cursorX += ctx.measureText(textRun).width
+      textRun = ''
+    }
+
     for (const token of line.tokens) {
       if (token.type === 'text') {
-        const textTopOffset = (line.height - token.height) / 2
-        ctx.fillText(token.text, cursorX, y + textTopOffset)
-        cursorX += token.width
+        if (
+          textRun.length > 0 &&
+          (token.fontWeight !== runFontWeight ||
+            token.fontFamily !== runFontFamily ||
+            token.color !== runColor)
+        ) {
+          flushTextRun()
+        }
+
+        if (textRun.length === 0) {
+          runFontWeight = token.fontWeight
+          runFontFamily = token.fontFamily
+          runColor = token.color
+        }
+
+        textRun += token.text
         continue
       }
 
+      flushTextRun()
       const asset = mathAssetMap.get(token.key) ?? null
       const isQuestionFont = fontFamily === QUESTION_FONT_FAMILY
       const inlineShiftEm =
@@ -1298,15 +1989,78 @@ function drawRichTextLines(args: {
       } else {
         const fallback = token.displayMode ? ` ${token.latex} ` : token.latex
         const textTopOffset = (line.height - fontSize * LINE_HEIGHT_RATIO) / 2 + verticalShift
+        ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`
+        ctx.fillStyle = color
         ctx.fillText(fallback, cursorX, y + textTopOffset)
       }
       cursorX += token.width
     }
+    flushTextRun()
     y += line.height
   }
 
   ctx.textBaseline = previousBaseline
   return y
+}
+
+function drawTableNode(args: {
+  ctx: CanvasRenderingContext2D
+  node: Extract<RenderNode, { type: 'table' }>
+  x: number
+  y: number
+  widthPx: number
+  mathAssetMap: Map<string, MathAsset | null>
+  draw: boolean
+}): number {
+  const { ctx, node, x, y: startY, widthPx, mathAssetMap, draw } = args
+  const layout = resolveTableNodeLayout({
+    ctx,
+    node,
+    widthPx,
+    mathAssetMap,
+  })
+
+  if (!draw) {
+    return startY + layout.totalHeight
+  }
+
+  let rowY = startY
+  layout.rows.forEach((row, rowIndex) => {
+    let cellX = x
+    layout.columnWidths.forEach((columnWidth, columnIndex) => {
+      if (rowIndex < node.headerRowCount) {
+        ctx.fillStyle = TABLE_HEADER_FILL_COLOR
+        ctx.fillRect(cellX, rowY, columnWidth, row.height)
+      }
+
+      ctx.strokeStyle = TABLE_BORDER_COLOR
+      ctx.lineWidth = 1
+      ctx.strokeRect(cellX, rowY, columnWidth, row.height)
+
+      const cell = row.cells[columnIndex]
+      if (cell) {
+        drawRichTextLines({
+          ctx,
+          lines: cell.lines,
+          x: cellX + TABLE_CELL_HORIZONTAL_PADDING_PX,
+          y: rowY + TABLE_CELL_VERTICAL_PADDING_PX,
+          maxWidth: Math.max(10, columnWidth - TABLE_CELL_HORIZONTAL_PADDING_PX * 2),
+          fontSize: node.fontSize,
+          fontWeight: node.bold ? 700 : 400,
+          fontFamily: node.fontFamily ?? QUESTION_FONT_FAMILY,
+          color: node.color ?? '#1e2430',
+          mathAssetMap,
+          draw: true,
+        })
+      }
+
+      cellX += columnWidth
+    })
+
+    rowY += row.height
+  })
+
+  return rowY
 }
 
 function splitRichTextLinesByHeight(lines: RichTextLine[], maxHeight: number): {
@@ -1331,6 +2085,49 @@ function splitRichTextLinesByHeight(lines: RichTextLine[], maxHeight: number): {
   return {
     head: lines.slice(0, index),
     tail: lines.slice(index),
+  }
+}
+
+function splitTableNodeByHeight(
+  node: Extract<RenderNode, { type: 'table' }>,
+  ctx: CanvasRenderingContext2D,
+  widthPx: number,
+  maxHeight: number,
+  mathAssetMap: Map<string, MathAsset | null>,
+): { head: Extract<RenderNode, { type: 'table' }>; tail: Extract<RenderNode, { type: 'table' }> } | null {
+  const layout = resolveTableNodeLayout({
+    ctx,
+    node,
+    widthPx,
+    mathAssetMap,
+  })
+
+  if (layout.rows.length <= node.headerRowCount + 1 || maxHeight <= 0) {
+    return null
+  }
+
+  let consumed = 0
+  let splitIndex = 0
+  while (splitIndex < layout.rows.length && consumed + layout.rows[splitIndex].height <= maxHeight) {
+    consumed += layout.rows[splitIndex].height
+    splitIndex += 1
+  }
+
+  if (splitIndex <= node.headerRowCount || splitIndex >= layout.rows.length) {
+    return null
+  }
+
+  const headerRows = node.rows.slice(0, node.headerRowCount)
+
+  return {
+    head: {
+      ...node,
+      rows: node.rows.slice(0, splitIndex),
+    },
+    tail: {
+      ...node,
+      rows: [...headerRows, ...node.rows.slice(splitIndex)],
+    },
   }
 }
 
@@ -1469,6 +2266,38 @@ function layoutAndDrawNodes(args: {
         ctx,
         fontSize: node.fontSize,
         maxWidth: widthPx,
+        bold: node.bold,
+        fontFamily,
+        color,
+        mathAssetMap,
+      })
+      y = drawRichTextLines({
+        ctx,
+        lines,
+        x,
+        y,
+        maxWidth: widthPx,
+        fontSize: node.fontSize,
+        fontWeight,
+        fontFamily,
+        color,
+        mathAssetMap,
+        draw,
+      })
+    }
+
+    if (node.type === 'richText') {
+      const fontWeight = node.bold ? 700 : 400
+      const fontFamily = node.fontFamily ?? QUESTION_FONT_FAMILY
+      const color = node.color ?? '#1e2430'
+      const lines = layoutRichTextSegmentLines({
+        segments: node.segments,
+        ctx,
+        fontSize: node.fontSize,
+        maxWidth: widthPx,
+        bold: node.bold,
+        fontFamily,
+        color,
         mathAssetMap,
       })
       y = drawRichTextLines({
@@ -1638,6 +2467,18 @@ function layoutAndDrawNodes(args: {
       }
     }
 
+    if (node.type === 'table') {
+      y = drawTableNode({
+        ctx,
+        node,
+        x,
+        y,
+        widthPx,
+        mathAssetMap,
+        draw,
+      })
+    }
+
     if (node.type === 'image') {
       const image = imageMap.get(node.src) ?? null
       const size = resolveImageDrawSize(image, widthPx)
@@ -1751,41 +2592,13 @@ function appendAnalysisSpacing(nodes: RenderNode[], spacingConfig: PdfExportSpac
   })
 }
 
-function buildChoiceStemNode(args: {
-  stemMarkdown: string
-  questionMarker?: string
-  questionLabel?: string
-}): RenderNode {
-  const { stemMarkdown, questionMarker, questionLabel } = args
-  const text = normalizeMarkdownText(stemMarkdown.replace(INLINE_TOKEN_REGEX, '')).trimEnd()
-
-  if (questionLabel) {
-    return {
-      type: 'choiceStem',
-      text,
-      trailingBlank: CHOICE_BLANK_TEXT,
-      fontSize: BASE_FONT_SIZE,
-      fontFamily: QUESTION_FONT_FAMILY,
-      color: '#1e2430',
-      leadText: `${questionLabel} `,
-      leadFontScale: 1,
-      leadGapPx: 0,
-      leadBold: true,
-    }
+function formatChoiceStemMarkdownForExport(normalizedStem: string): string {
+  const withoutTrailingBlank = normalizedStem.replace(/\s*\[\[INLINE_BLANK_\d+\]\]\s*$/u, '')
+  if (withoutTrailingBlank !== normalizedStem) {
+    return withoutTrailingBlank.trimEnd()
   }
 
-  return {
-    type: 'choiceStem',
-    text,
-    trailingBlank: CHOICE_BLANK_TEXT,
-    fontSize: BASE_FONT_SIZE,
-    fontFamily: QUESTION_FONT_FAMILY,
-    color: '#1e2430',
-    leadText: questionMarker,
-    leadFontScale: QUESTION_MARKER_SCALE,
-    leadGapPx: questionMarker ? QUESTION_MARKER_GAP_PX : 0,
-    leadBold: true,
-  }
+  return normalizedStem.replace(INLINE_TOKEN_REGEX, CHOICE_BLANK_TEXT)
 }
 
 function appendChoiceContentNodes(args: {
@@ -1793,6 +2606,7 @@ function appendChoiceContentNodes(args: {
   normalizedStem: string
   optionCount: number
   options: string[]
+  correctAnswers: number[]
   optionStyle: ChoiceSubQuestion['optionStyle']
   spacingConfig: PdfExportSpacingConfig
   questionMarker?: string
@@ -1804,6 +2618,7 @@ function appendChoiceContentNodes(args: {
     normalizedStem,
     optionCount,
     options,
+    correctAnswers,
     optionStyle,
     spacingConfig,
     questionMarker,
@@ -1811,18 +2626,19 @@ function appendChoiceContentNodes(args: {
     includeTrailingSpace = true,
   } = args
 
-  const stemMarkdown = normalizedStem
+  const stemMarkdown = formatChoiceStemMarkdownForExport(normalizedStem)
   const stemSplit = splitMarkdownTextAndImages(stemMarkdown)
-  const stemNodes =
-    stemSplit.textMarkdown.length > 0 || questionLabel || questionMarker
-      ? [
-          buildChoiceStemNode({
-            stemMarkdown: stemSplit.textMarkdown,
-            questionLabel,
-            questionMarker,
-          }),
-        ]
-      : []
+  const rawStemNodes = stemSplit.textMarkdown.length > 0 ? markdownToNodes(stemSplit.textMarkdown) : []
+  const stemNodes = questionLabel
+    ? prependLabelToNodes(`${questionLabel} `, rawStemNodes, {
+        bold: true,
+        fontSize: BASE_FONT_SIZE,
+        fontFamily: QUESTION_FONT_FAMILY,
+        color: '#1e2430',
+      })
+    : questionMarker
+      ? prependQuestionMarkerToNodes(questionMarker, rawStemNodes)
+      : rawStemNodes
 
   nodes.push(...stemNodes)
 
@@ -1848,7 +2664,11 @@ function appendChoiceContentNodes(args: {
   const visibleOptions = options.slice(0, optionCount)
   visibleOptions.forEach((option, index) => {
     const marker = buildOptionMarker(index, optionStyle)
-    const optionNodes = prependLabelToNodes(`${marker}. `, markdownToNodes(option))
+    const isCorrect = correctAnswers.includes(index)
+    const optionColor = isCorrect ? CORRECT_OPTION_COLOR : '#1e2430'
+    const optionNodes = prependLabelToNodes(`${marker}. `, markdownToNodes(option, { color: optionColor }), {
+      color: optionColor,
+    })
     nodes.push(...optionNodes)
     if (index < visibleOptions.length - 1) {
       nodes.push({
@@ -1885,6 +2705,7 @@ function buildChoicePlan(
     normalizedStem,
     optionCount: question.optionCount,
     options: question.options,
+    correctAnswers: question.correctAnswers,
     optionStyle: question.optionStyle,
     spacingConfig,
     questionMarker: marker,
@@ -2054,6 +2875,7 @@ function buildChoiceGroupPlan(
       normalizedStem,
       optionCount: subquestion.optionCount,
       options: subquestion.options,
+      correctAnswers: subquestion.correctAnswers,
       optionStyle: subquestion.optionStyle,
       spacingConfig,
       questionLabel: `${index + 1}.`,
@@ -2499,6 +3321,44 @@ export async function exportQuestionsAsPdf(
         ctx: measureCtx,
         fontSize: node.fontSize,
         maxWidth: columnWidthPx,
+        bold: node.bold,
+        fontFamily,
+        color: node.color,
+        mathAssetMap,
+      })
+      const split = splitRichTextLinesByHeight(lines, maxHeight)
+      if (!split) {
+        return null
+      }
+      return {
+        head: {
+          type: 'richTextLines',
+          lines: split.head,
+          fontSize: node.fontSize,
+          bold: node.bold,
+          fontFamily: node.fontFamily,
+          color: node.color,
+        },
+        tail: {
+          type: 'richTextLines',
+          lines: split.tail,
+          fontSize: node.fontSize,
+          bold: node.bold,
+          fontFamily: node.fontFamily,
+          color: node.color,
+        },
+      }
+    }
+
+    if (node.type === 'richText') {
+      const lines = layoutRichTextSegmentLines({
+        segments: node.segments,
+        ctx: measureCtx,
+        fontSize: node.fontSize,
+        maxWidth: columnWidthPx,
+        bold: node.bold,
+        fontFamily: node.fontFamily,
+        color: node.color,
         mathAssetMap,
       })
       const split = splitRichTextLinesByHeight(lines, maxHeight)
@@ -2548,6 +3408,10 @@ export async function exportQuestionsAsPdf(
           color: node.color,
         },
       }
+    }
+
+    if (node.type === 'table') {
+      return splitTableNodeByHeight(node, measureCtx, columnWidthPx, maxHeight, mathAssetMap)
     }
 
     return null
