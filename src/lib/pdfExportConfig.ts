@@ -14,10 +14,18 @@ export interface PdfExportSpacingConfig {
   subjectiveMathAnswerSpaceMm: number
   subjectiveAfterAnswerSpaceMm: number
   analysisTopGapMm: number
+  bindingMarginMm: number
+  firstPageBindingSide: 'left' | 'right'
+  renderLooseLeafHoles: boolean
 }
 
+type NumericPdfExportSpacingKey = Exclude<
+  keyof PdfExportSpacingConfig,
+  'firstPageBindingSide' | 'renderLooseLeafHoles'
+>
+
 export interface PdfExportSpacingField {
-  key: keyof PdfExportSpacingConfig
+  key: NumericPdfExportSpacingKey
   label: string
   description: string
   min: number
@@ -25,7 +33,7 @@ export interface PdfExportSpacingField {
   step: number
 }
 
-export const PDF_EXPORT_SPACING_STORAGE_KEY = 'mistakes.pdf-export-spacing.v1'
+export const PDF_EXPORT_SPACING_STORAGE_KEY = 'mistakes.pdf-export-spacing.v2'
 
 export const DEFAULT_PDF_EXPORT_SPACING_CONFIG: PdfExportSpacingConfig = {
   choiceStemGapMm: 10,
@@ -43,6 +51,9 @@ export const DEFAULT_PDF_EXPORT_SPACING_CONFIG: PdfExportSpacingConfig = {
   subjectiveMathAnswerSpaceMm: 70,
   subjectiveAfterAnswerSpaceMm: 50,
   analysisTopGapMm: 5,
+  bindingMarginMm: 4,
+  firstPageBindingSide: 'left',
+  renderLooseLeafHoles: true,
 }
 
 export const PDF_EXPORT_SPACING_FIELDS: PdfExportSpacingField[] = [
@@ -166,6 +177,14 @@ export const PDF_EXPORT_SPACING_FIELDS: PdfExportSpacingField[] = [
     max: 40,
     step: 1,
   },
+  {
+    key: 'bindingMarginMm',
+    label: '装订侧额外边距',
+    description: '打印时装订侧追加的安全留白，默认用于 B5 活页打孔避让。',
+    min: 0,
+    max: 20,
+    step: 0.5,
+  },
 ]
 
 function normalizeSpacingValue(
@@ -186,15 +205,29 @@ export function sanitizePdfExportSpacingConfig(
 ): PdfExportSpacingConfig {
   const source = input && typeof input === 'object' ? (input as Record<string, unknown>) : {}
 
-  return PDF_EXPORT_SPACING_FIELDS.reduce<PdfExportSpacingConfig>((result, field) => {
-    result[field.key] = normalizeSpacingValue(
-      source[field.key],
-      DEFAULT_PDF_EXPORT_SPACING_CONFIG[field.key],
-      field.min,
-      field.max,
-    )
-    return result
-  }, { ...DEFAULT_PDF_EXPORT_SPACING_CONFIG })
+  const sanitized = PDF_EXPORT_SPACING_FIELDS.reduce<PdfExportSpacingConfig>(
+    (result, field) => {
+      result[field.key] = normalizeSpacingValue(
+        source[field.key],
+        DEFAULT_PDF_EXPORT_SPACING_CONFIG[field.key],
+        field.min,
+        field.max,
+      )
+      return result
+    },
+    { ...DEFAULT_PDF_EXPORT_SPACING_CONFIG },
+  )
+
+  sanitized.firstPageBindingSide =
+    source.firstPageBindingSide === 'right'
+      ? 'right'
+      : DEFAULT_PDF_EXPORT_SPACING_CONFIG.firstPageBindingSide
+  sanitized.renderLooseLeafHoles =
+    typeof source.renderLooseLeafHoles === 'boolean'
+      ? source.renderLooseLeafHoles
+      : DEFAULT_PDF_EXPORT_SPACING_CONFIG.renderLooseLeafHoles
+
+  return sanitized
 }
 
 export function loadPdfExportSpacingConfig(): PdfExportSpacingConfig {

@@ -78,6 +78,7 @@ type ChatMessageContent = string | ChatContentPart[]
 
 const QUESTIONS_KEY = 'mistakes.questions.v1'
 const LAST_CREATED_SUBJECT_KEY = 'mistakes.last-created-subject.v1'
+const AI_SETTINGS_LOCAL_STORAGE_KEY = 'mistakes.ai-settings.snapshot.v1'
 const AI_SETTINGS_CLOUD_URL = import.meta.env.VITE_AI_SETTINGS_URL?.trim() || '/api/ai-settings'
 const AI_SETTINGS_CLOUD_TOKEN = import.meta.env.VITE_AI_SETTINGS_TOKEN?.trim() || ''
 const AI_SETTINGS_CLOUD_SAVE_METHOD =
@@ -88,6 +89,21 @@ const INITIAL_AI_SETTINGS: AiSettings = {
   baseUrl: '',
   apiKey: '',
   model: '',
+}
+
+interface AiSettingsSnapshot {
+  settings: AiSettings
+  updatedAt: string
+}
+
+interface ComparableAiSettingsSnapshot {
+  settings: AiSettings
+  updatedAt: string | null
+}
+
+interface ParsedAiSettingsCloudPayload {
+  exists: boolean
+  snapshot: ComparableAiSettingsSnapshot | null
 }
 
 const QUESTION_TYPE_LABEL: Record<QuestionType, string> = {
@@ -440,26 +456,12 @@ function buildAIEndpoint(baseUrl: string): string {
   return `${trimmed}/chat/completions`
 }
 
-function parseAiSettingsFromPayload(payload: unknown): AiSettings | null {
-  if (!payload || typeof payload !== 'object') {
-    return null
+function normalizeAiSettings(raw: unknown): AiSettings {
+  if (!raw || typeof raw !== 'object') {
+    return { ...INITIAL_AI_SETTINGS }
   }
 
-  const root = payload as Record<string, unknown>
-  const nestedSettings = root.settings
-  const nestedData = root.data
-  const candidate =
-    nestedSettings && typeof nestedSettings === 'object'
-      ? nestedSettings
-      : nestedData && typeof nestedData === 'object'
-        ? nestedData
-        : root
-
-  if (!candidate || typeof candidate !== 'object') {
-    return null
-  }
-
-  const source = candidate as Record<string, unknown>
+  const source = raw as Record<string, unknown>
   const baseUrl = typeof source.baseUrl === 'string' ? source.baseUrl.trim() : ''
   const apiKey = typeof source.apiKey === 'string' ? source.apiKey.trim() : ''
   const model = typeof source.model === 'string' ? source.model.trim() : ''
@@ -472,6 +474,148 @@ function parseAiSettingsFromPayload(payload: unknown): AiSettings | null {
     model,
   }
 }
+
+function normalizeTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const trimmed = value.trim()
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  const timestamp = Date.parse(trimmed)
+  if (Number.isNaN(timestamp)) {
+    return null
+  }
+
+  return new Date(timestamp).toISOString()
+}
+
+function hasAiSettingsFields(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const source = value as Record<string, unknown>
+  return 'enabled' in source || 'baseUrl' in source || 'apiKey' in source || 'model' in source
+}
+
+function parseAiSettingsSnapshotLike(payload: unknown): ComparableAiSettingsSnapshot | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const root = payload as Record<string, unknown>
+
+  if (root.snapshot && typeof root.snapshot === 'object') {
+    const parsed = parseAiSettingsSnapshotLike(root.snapshot)
+    if (parsed) {
+      return parsed
+    }
+  }
+
+  if (root.data && typeof root.data === 'object') {
+    const parsed = parseAiSettingsSnapshotLike(root.data)
+    if (parsed) {
+      return parsed
+    }
+  }
+
+  if (root.settings && typeof root.settings === 'object') {
+    const nestedSettings = root.settings as Record<string, unknown>
+    if (hasAiSettingsFields(nestedSettings)) {
+      return {
+        settings: normalizeAiSettings(nestedSettings),
+        updatedAt: normalizeTimestamp(root.updatedAt),
+      }
+    }
+
+    const parsed = parseAiSettingsSnapshotLike(nestedSettings)
+    if (parsed) {
+      return parsed
+    }
+  }
+
+  if (!hasAiSettingsFields(root)) {
+    return null
+  }
+
+  return {
+    settings: normalizeAiSettings(root),
+    updatedAt: normalizeTimestamp(root.updatedAt),
+  }
+}
+
+function parseAiSettingsCloudPayload(payload: unknown): ParsedAiSettingsCloudPayload | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const source = payload as Record<string, unknown>
+  const snapshot = parseAiSettingsSnapshotLike(payload)
+  const exists = typeof source.exists === 'boolean' ? source.exists : snapshot !== null
+  return {
+    exists,
+    snapshot: exists ? snapshot : null,
+  }
+}
+
+function loadAiSettingsSnapshotFromLocalStorage(): ComparableAiSettingsSnapshot | null {
+  const cached = fromLocalStorage<unknown | null>(AI_SETTINGS_LOCAL_STORAGE_KEY, null)
+  return parseAiSettingsSnapshotLike(cached)
+}
+
+function saveAiSettingsSnapshotToLocalStorage(snapshot: AiSettingsSnapshot): void {
+  toLocalStorage(AI_SETTINGS_LOCAL_STORAGE_KEY, snapshot)
+}
+
+function materializeAiSettingsSnapshot(snapshot: ComparableAiSettingsSnapshot): AiSettingsSnapshot {
+  return {
+    settings: normalizeAiSettings(snapshot.settings),
+    updatedAt: snapshot.updatedAt ?? new Date().toISOString(),
+  }
+}
+
+function getAiSettingsSnapshotTime(snapshot: ComparableAiSettingsSnapshot | null): number {
+  if (!snapshot?.updatedAt) {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  const timestamp = Date.parse(snapshot.updatedAt)
+  return Number.isNaN(timestamp) ? Number.NEGATIVE_INFINITY : timestamp
+}
+
+function compareAiSettingsSnapshots(
+  left: ComparableAiSettingsSnapshot | null,
+  right: ComparableAiSettingsSnapshot | null,
+): number {
+  return getAiSettingsSnapshotTime(left) - getAiSettingsSnapshotTime(right)
+}
+
+function areAiSettingsEqual(left: AiSettings, right: AiSettings): boolean {
+  return (
+    left.enabled === right.enabled &&
+    left.baseUrl === right.baseUrl &&
+    left.apiKey === right.apiKey &&
+    left.model === right.model
+  )
+}
+
+function areAiSettingsSnapshotsEqual(
+  left: ComparableAiSettingsSnapshot | null,
+  right: ComparableAiSettingsSnapshot | null,
+): boolean {
+  if (!left || !right) {
+    return left === right
+  }
+
+  return left.updatedAt === right.updatedAt && areAiSettingsEqual(left.settings, right.settings)
+}
+
+const INITIAL_LOCAL_AI_SETTINGS_SNAPSHOT =
+  typeof window !== 'undefined' ? loadAiSettingsSnapshotFromLocalStorage() : null
 
 function getPayloadMessage(payload: unknown): string | null {
   if (!payload || typeof payload !== 'object') {
@@ -1196,11 +1340,15 @@ function App() {
   const location = useLocation()
   const navigate = useNavigate()
 
-  const [settings, setSettings] = useState<AiSettings>(INITIAL_AI_SETTINGS)
+  const [settings, setSettings] = useState<AiSettings>(
+    INITIAL_LOCAL_AI_SETTINGS_SNAPSHOT?.settings ?? INITIAL_AI_SETTINGS,
+  )
   const [aiSettingsLoaded, setAiSettingsLoaded] = useState(false)
   const [aiSettingsSyncing, setAiSettingsSyncing] = useState(false)
   const [aiSettingsSaving, setAiSettingsSaving] = useState(false)
-  const [aiSettingsSyncedAt, setAiSettingsSyncedAt] = useState<string | null>(null)
+  const [aiSettingsSyncedAt, setAiSettingsSyncedAt] = useState<string | null>(
+    INITIAL_LOCAL_AI_SETTINGS_SNAPSHOT?.updatedAt ?? null,
+  )
   const [questions, setQuestions] = useState<Question[]>(() =>
     hydrateQuestions(fromLocalStorage(QUESTIONS_KEY, [])),
   )
@@ -1316,6 +1464,7 @@ function App() {
   const syncAiSettingsFromCloud = useCallback(
     async (showSuccessNotice = false, showErrorNotice = true) => {
       setAiSettingsSyncing(true)
+      const localSnapshot = loadAiSettingsSnapshotFromLocalStorage()
       try {
         const headers: HeadersInit = {}
         if (AI_SETTINGS_CLOUD_TOKEN) {
@@ -1332,21 +1481,80 @@ function App() {
           throw new Error(detail || `云端配置拉取失败（HTTP ${response.status}）`)
         }
 
-        const parsed = parseAiSettingsFromPayload(payload)
+        const parsed = parseAiSettingsCloudPayload(payload)
         if (!parsed) {
           throw new Error('云端配置格式错误，请检查接口返回。')
         }
 
-        setSettings(parsed)
-        const syncedAt = new Date().toISOString()
-        setAiSettingsSyncedAt(syncedAt)
+        const cloudSnapshot = parsed.snapshot
+        const chosenSnapshotSource =
+          localSnapshot && cloudSnapshot
+            ? compareAiSettingsSnapshots(localSnapshot, cloudSnapshot) > 0
+              ? localSnapshot
+              : cloudSnapshot
+            : localSnapshot ?? cloudSnapshot
+
+        const resolvedSnapshot = chosenSnapshotSource ? materializeAiSettingsSnapshot(chosenSnapshotSource) : null
+        const localNeedsSync =
+          resolvedSnapshot !== null && !areAiSettingsSnapshotsEqual(localSnapshot, resolvedSnapshot)
+        const cloudNeedsSync =
+          resolvedSnapshot !== null && (!parsed.exists || !areAiSettingsSnapshotsEqual(cloudSnapshot, resolvedSnapshot))
+
+        let finalSnapshot = resolvedSnapshot
+        if (resolvedSnapshot && cloudNeedsSync) {
+          const syncHeaders: HeadersInit = {
+            'Content-Type': 'application/json',
+          }
+          if (AI_SETTINGS_CLOUD_TOKEN) {
+            syncHeaders.Authorization = `Bearer ${AI_SETTINGS_CLOUD_TOKEN}`
+          }
+
+          const saveResponse = await fetch(AI_SETTINGS_CLOUD_URL, {
+            method: AI_SETTINGS_CLOUD_SAVE_METHOD,
+            headers: syncHeaders,
+            body: JSON.stringify(resolvedSnapshot),
+          })
+          const savePayload = await parseCloudResponseJson(saveResponse)
+          if (!saveResponse.ok) {
+            const detail = getPayloadMessage(savePayload)
+            throw new Error(detail || `云端配置保存失败（HTTP ${saveResponse.status}）`)
+          }
+
+          const saved = parseAiSettingsCloudPayload(savePayload)
+          if (!saved?.snapshot) {
+            throw new Error('云端配置保存后返回格式错误，请检查接口返回。')
+          }
+
+          finalSnapshot = materializeAiSettingsSnapshot(saved.snapshot)
+        }
+
+        if (finalSnapshot && (localNeedsSync || cloudNeedsSync)) {
+          saveAiSettingsSnapshotToLocalStorage(finalSnapshot)
+        }
+
+        setSettings(finalSnapshot?.settings ?? INITIAL_AI_SETTINGS)
+        setAiSettingsSyncedAt(finalSnapshot?.updatedAt ?? null)
         if (showSuccessNotice) {
-          setNotice('已从云端同步 AI 配置。')
+          if (finalSnapshot && cloudNeedsSync && !parsed.exists) {
+            setNotice('检测到云端缺失，已用本地配置自动修复并同步。')
+          } else if (finalSnapshot && cloudNeedsSync) {
+            setNotice('已按较新版本完成 AI 配置双向同步。')
+          } else if (finalSnapshot && localNeedsSync) {
+            setNotice('已从云端同步 AI 配置并写入本地缓存。')
+          } else {
+            setNotice('已从云端同步 AI 配置。')
+          }
         }
       } catch (error) {
+        if (localSnapshot) {
+          const fallbackSnapshot = materializeAiSettingsSnapshot(localSnapshot)
+          saveAiSettingsSnapshotToLocalStorage(fallbackSnapshot)
+          setSettings(fallbackSnapshot.settings)
+          setAiSettingsSyncedAt(fallbackSnapshot.updatedAt)
+        }
         if (showErrorNotice) {
           const message = error instanceof Error ? error.message : '云端配置拉取失败'
-          setNotice(message)
+          setNotice(localSnapshot ? `${message}，已回退到本地配置。` : message)
         }
       } finally {
         setAiSettingsSyncing(false)
@@ -1359,6 +1567,19 @@ function App() {
   const saveAiSettingsToCloud = useCallback(async () => {
     setAiSettingsSaving(true)
     try {
+      const nextSnapshot: AiSettingsSnapshot = {
+        settings: {
+          enabled: settings.enabled,
+          baseUrl: settings.baseUrl.trim(),
+          apiKey: settings.apiKey.trim(),
+          model: settings.model.trim(),
+        },
+        updatedAt: new Date().toISOString(),
+      }
+      saveAiSettingsSnapshotToLocalStorage(nextSnapshot)
+      setSettings(nextSnapshot.settings)
+      setAiSettingsSyncedAt(nextSnapshot.updatedAt)
+
       const headers: HeadersInit = {
         'Content-Type': 'application/json',
       }
@@ -1369,14 +1590,7 @@ function App() {
       const response = await fetch(AI_SETTINGS_CLOUD_URL, {
         method: AI_SETTINGS_CLOUD_SAVE_METHOD,
         headers,
-        body: JSON.stringify({
-          settings: {
-            enabled: settings.enabled,
-            baseUrl: settings.baseUrl.trim(),
-            apiKey: settings.apiKey.trim(),
-            model: settings.model.trim(),
-          },
-        }),
+        body: JSON.stringify(nextSnapshot),
       })
 
       const payload = await parseCloudResponseJson(response)
@@ -1385,15 +1599,15 @@ function App() {
         throw new Error(detail || `云端配置保存失败（HTTP ${response.status}）`)
       }
 
-      const parsed = parseAiSettingsFromPayload(payload)
-      if (parsed) {
-        setSettings(parsed)
-      }
-      setAiSettingsSyncedAt(new Date().toISOString())
-      setNotice('AI 配置已保存到云端。')
+      const parsed = parseAiSettingsCloudPayload(payload)
+      const savedSnapshot = parsed?.snapshot ? materializeAiSettingsSnapshot(parsed.snapshot) : nextSnapshot
+      saveAiSettingsSnapshotToLocalStorage(savedSnapshot)
+      setSettings(savedSnapshot.settings)
+      setAiSettingsSyncedAt(savedSnapshot.updatedAt)
+      setNotice('AI 配置已同步到云端和本地缓存。')
     } catch (error) {
       const message = error instanceof Error ? error.message : '云端配置保存失败'
-      setNotice(message)
+      setNotice(`${message}，新配置已保存在本地缓存，稍后会自动回补云端。`)
     } finally {
       setAiSettingsSaving(false)
       setAiSettingsLoaded(true)
@@ -2753,7 +2967,7 @@ function App() {
             <section className="pane">
               <header className="pane-head">
                 <h2>AI 设置</h2>
-                <p>可在客户端编辑并保存到云端，设备间通过云端配置同步。</p>
+                <p>启动时会比较云端与本地缓存版本，优先使用时间戳较新的配置，并自动回写较旧的一侧。</p>
               </header>
 
               <div className="settings-grid">

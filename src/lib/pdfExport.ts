@@ -17,6 +17,10 @@ const PAGE_HEIGHT_MM = 257
 const PAGE_MARGIN_MM = 8
 const COLUMN_GAP_MM = 6
 const PX_PER_MM = 10
+const LOOSE_LEAF_HOLE_COUNT = 26
+const LOOSE_LEAF_HOLE_PITCH_MM = 9.5
+const LOOSE_LEAF_HOLE_DIAMETER_MM = 5.5
+const LOOSE_LEAF_HOLE_OFFSET_MM = 6.25
 
 const QUESTION_FONT_FAMILY =
   '"Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif'
@@ -78,6 +82,19 @@ type RenderNode =
       markerScale?: number
     }
   | {
+      type: 'choiceStem'
+      text: string
+      trailingBlank: string
+      fontSize: number
+      bold?: boolean
+      fontFamily?: string
+      color?: string
+      leadText?: string
+      leadFontScale?: number
+      leadGapPx?: number
+      leadBold?: boolean
+    }
+  | {
       type: 'imageRow'
       images: Array<{
         src: string
@@ -104,6 +121,10 @@ interface PageState {
   canvas: HTMLCanvasElement
   ctx: CanvasRenderingContext2D
   columnY: [number, number]
+  leftX: number
+  rightX: number
+  dividerX: number
+  bindingSide: 'left' | 'right'
 }
 
 interface TextNodeStyle {
@@ -1032,6 +1053,180 @@ function layoutRichTextLines(args: {
   return lines
 }
 
+function layoutRichTextLinesWithFirstLineOffset(args: {
+  text: string
+  ctx: CanvasRenderingContext2D
+  fontSize: number
+  maxWidth: number
+  firstLineOffset: number
+  mathAssetMap: Map<string, MathAsset | null>
+}): RichTextLine[] {
+  const { text, ctx, fontSize, maxWidth, firstLineOffset, mathAssetMap } = args
+  const tokens = tokenizeRichText(text, ctx, fontSize, maxWidth, mathAssetMap)
+  const lines: RichTextLine[] = []
+  const defaultHeight = fontSize * LINE_HEIGHT_RATIO
+  let currentTokens: RenderInlineToken[] = []
+  let currentWidth = 0
+  let currentHeight = defaultHeight
+  let isFirstLine = true
+
+  const currentMaxWidth = () =>
+    Math.max(10, maxWidth - (isFirstLine ? Math.max(0, firstLineOffset) : 0))
+
+  const pushCurrentLine = (forceEmpty = false) => {
+    if (currentTokens.length > 0 || forceEmpty) {
+      lines.push({
+        tokens: [...currentTokens],
+        width: currentWidth,
+        height: currentHeight,
+      })
+    }
+    currentTokens = []
+    currentWidth = 0
+    currentHeight = defaultHeight
+    isFirstLine = false
+  }
+
+  for (const token of tokens) {
+    if (token.type === 'lineBreak') {
+      pushCurrentLine(true)
+      continue
+    }
+
+    if (token.type === 'math' && token.displayMode) {
+      if (currentTokens.length > 0) {
+        pushCurrentLine(false)
+      }
+      lines.push({
+        tokens: [token],
+        width: token.width,
+        height: Math.max(defaultHeight, token.height),
+      })
+      isFirstLine = false
+      continue
+    }
+
+    if (currentWidth + token.width > currentMaxWidth() && currentTokens.length > 0) {
+      const tokenIsNoLineStartText =
+        token.type === 'text' &&
+        token.text.length === 1 &&
+        NO_LINE_START_CHARS.includes(token.text)
+
+      if (!tokenIsNoLineStartText) {
+        const lastToken = currentTokens[currentTokens.length - 1]
+        const canCarryTail =
+          lastToken &&
+          lastToken.type === 'text' &&
+          lastToken.text.length === 1 &&
+          NO_LINE_END_CHARS.includes(lastToken.text) &&
+          currentTokens.length > 1
+
+        if (canCarryTail && lastToken.type === 'text') {
+          currentTokens.pop()
+          currentWidth -= lastToken.width
+          currentHeight = Math.max(defaultHeight, ...currentTokens.map((item) => item.height))
+          pushCurrentLine(false)
+          currentTokens.push(lastToken)
+          currentWidth = lastToken.width
+          currentHeight = Math.max(defaultHeight, lastToken.height)
+        } else {
+          pushCurrentLine(false)
+        }
+      }
+    }
+
+    currentTokens.push(token)
+    currentWidth += token.width
+    currentHeight = Math.max(currentHeight, token.height)
+  }
+
+  if (currentTokens.length > 0 || lines.length === 0) {
+    pushCurrentLine(false)
+  }
+
+  return lines
+}
+
+function resolveChoiceStemNodeLayout(args: {
+  ctx: CanvasRenderingContext2D
+  node: Extract<RenderNode, { type: 'choiceStem' }>
+  widthPx: number
+  mathAssetMap: Map<string, MathAsset | null>
+}): {
+  lines: RichTextLine[]
+  fontWeight: number
+  fontFamily: string
+  color: string
+  leadText: string
+  leadGapPx: number
+  leadFontSize: number
+  leadFontWeight: number
+  leadingWidth: number
+  trailingBlankWidth: number
+  trailingBlankFitsOnLastLine: boolean
+  trailingBlankLineHeight: number
+  totalHeight: number
+} {
+  const { ctx, node, widthPx, mathAssetMap } = args
+  const fontWeight = node.bold ? 700 : 400
+  const fontFamily = node.fontFamily ?? QUESTION_FONT_FAMILY
+  const color = node.color ?? '#1e2430'
+  const leadText = node.leadText ?? ''
+  const leadGapPx = leadText.length > 0 ? node.leadGapPx ?? 0 : 0
+  const leadFontScale = node.leadFontScale ?? 1
+  const leadFontSize = node.fontSize * leadFontScale
+  const leadFontWeight = node.leadBold || leadFontScale > 1 ? Math.max(700, fontWeight) : fontWeight
+
+  let leadingWidth = 0
+  if (leadText.length > 0) {
+    ctx.font = `${leadFontWeight} ${leadFontSize}px ${fontFamily}`
+    leadingWidth = ctx.measureText(leadText).width + leadGapPx
+  }
+
+  const lines = layoutRichTextLinesWithFirstLineOffset({
+    text: node.text,
+    ctx,
+    fontSize: node.fontSize,
+    maxWidth: widthPx,
+    firstLineOffset: leadingWidth,
+    mathAssetMap,
+  })
+
+  const leadLineHeight = leadText.length > 0 ? leadFontSize * LINE_HEIGHT_RATIO : 0
+  if (lines.length > 0 && leadLineHeight > lines[0].height) {
+    lines[0] = {
+      ...lines[0],
+      height: leadLineHeight,
+    }
+  }
+
+  ctx.font = `${fontWeight} ${node.fontSize}px ${fontFamily}`
+  const trailingBlankWidth = ctx.measureText(node.trailingBlank).width
+  const trailingBlankLineHeight = node.fontSize * LINE_HEIGHT_RATIO
+  const lastLine = lines[lines.length - 1]
+  const lastLineAvailableWidth = lines.length === 1 ? Math.max(10, widthPx - leadingWidth) : widthPx
+  const trailingBlankFitsOnLastLine =
+    !!lastLine && lastLine.width + trailingBlankWidth <= lastLineAvailableWidth
+  const totalHeight =
+    measureRichTextLinesHeight(lines) + (trailingBlankFitsOnLastLine ? 0 : trailingBlankLineHeight)
+
+  return {
+    lines,
+    fontWeight,
+    fontFamily,
+    color,
+    leadText,
+    leadGapPx,
+    leadFontSize,
+    leadFontWeight,
+    leadingWidth,
+    trailingBlankWidth,
+    trailingBlankFitsOnLastLine,
+    trailingBlankLineHeight,
+    totalHeight,
+  }
+}
+
 function measureRichTextLinesHeight(lines: RichTextLine[]): number {
   return lines.reduce((sum, line) => sum + line.height, 0)
 }
@@ -1357,6 +1552,92 @@ function layoutAndDrawNodes(args: {
       }
     }
 
+    if (node.type === 'choiceStem') {
+      const layout = resolveChoiceStemNodeLayout({
+        ctx,
+        node,
+        widthPx,
+        mathAssetMap,
+      })
+
+      if (draw) {
+        const previousBaseline = ctx.textBaseline
+        ctx.textBaseline = 'top'
+        ctx.fillStyle = layout.color
+
+        let lineY = y
+        layout.lines.forEach((line, index) => {
+          const lineX = x + (index === 0 ? layout.leadingWidth : 0)
+          const availableWidth = index === 0 ? Math.max(10, widthPx - layout.leadingWidth) : widthPx
+
+          if (index === 0 && layout.leadText.length > 0) {
+            ctx.font = `${layout.leadFontWeight} ${layout.leadFontSize}px ${layout.fontFamily}`
+            const leadTopOffset = (line.height - layout.leadFontSize * LINE_HEIGHT_RATIO) / 2
+            ctx.fillText(layout.leadText, x, lineY + leadTopOffset)
+          }
+
+          ctx.font = `${layout.fontWeight} ${node.fontSize}px ${layout.fontFamily}`
+          let cursorX = lineX
+          const shouldCenterDisplayLine =
+            line.tokens.length === 1 &&
+            line.tokens[0].type === 'math' &&
+            line.tokens[0].displayMode === true
+
+          if (shouldCenterDisplayLine) {
+            cursorX = lineX + Math.max(0, (availableWidth - line.width) / 2)
+          }
+
+          for (const token of line.tokens) {
+            if (token.type === 'text') {
+              const textTopOffset = (line.height - token.height) / 2
+              ctx.fillText(token.text, cursorX, lineY + textTopOffset)
+              cursorX += token.width
+              continue
+            }
+
+            const asset = mathAssetMap.get(token.key) ?? null
+            const isQuestionFont = layout.fontFamily === QUESTION_FONT_FAMILY
+            const inlineShiftEm =
+              INLINE_MATH_ASCENT_SHIFT_EM +
+              (isQuestionFont ? QUESTION_INLINE_MATH_EXTRA_SHIFT_EM : 0)
+            const verticalShift = token.displayMode ? 0 : -node.fontSize * inlineShiftEm
+            const drawTop = lineY + (line.height - token.height) / 2 + verticalShift
+            if (asset) {
+              ctx.drawImage(asset.canvas, cursorX, drawTop, token.width, token.height)
+            } else {
+              const fallback = token.displayMode ? ` ${token.latex} ` : token.latex
+              const textTopOffset =
+                (line.height - node.fontSize * LINE_HEIGHT_RATIO) / 2 + verticalShift
+              ctx.fillText(fallback, cursorX, lineY + textTopOffset)
+            }
+            cursorX += token.width
+          }
+
+          if (index === layout.lines.length - 1 && layout.trailingBlankFitsOnLastLine) {
+            const blankTopOffset = (line.height - layout.trailingBlankLineHeight) / 2
+            ctx.fillText(
+              node.trailingBlank,
+              x + widthPx - layout.trailingBlankWidth,
+              lineY + blankTopOffset,
+            )
+          }
+
+          lineY += line.height
+        })
+
+        if (!layout.trailingBlankFitsOnLastLine) {
+          ctx.font = `${layout.fontWeight} ${node.fontSize}px ${layout.fontFamily}`
+          ctx.fillText(node.trailingBlank, x + widthPx - layout.trailingBlankWidth, lineY)
+          lineY += layout.trailingBlankLineHeight
+        }
+
+        ctx.textBaseline = previousBaseline
+        y = lineY
+      } else {
+        y += layout.totalHeight
+      }
+    }
+
     if (node.type === 'image') {
       const image = imageMap.get(node.src) ?? null
       const size = resolveImageDrawSize(image, widthPx)
@@ -1470,6 +1751,43 @@ function appendAnalysisSpacing(nodes: RenderNode[], spacingConfig: PdfExportSpac
   })
 }
 
+function buildChoiceStemNode(args: {
+  stemMarkdown: string
+  questionMarker?: string
+  questionLabel?: string
+}): RenderNode {
+  const { stemMarkdown, questionMarker, questionLabel } = args
+  const text = normalizeMarkdownText(stemMarkdown.replace(INLINE_TOKEN_REGEX, '')).trimEnd()
+
+  if (questionLabel) {
+    return {
+      type: 'choiceStem',
+      text,
+      trailingBlank: CHOICE_BLANK_TEXT,
+      fontSize: BASE_FONT_SIZE,
+      fontFamily: QUESTION_FONT_FAMILY,
+      color: '#1e2430',
+      leadText: `${questionLabel} `,
+      leadFontScale: 1,
+      leadGapPx: 0,
+      leadBold: true,
+    }
+  }
+
+  return {
+    type: 'choiceStem',
+    text,
+    trailingBlank: CHOICE_BLANK_TEXT,
+    fontSize: BASE_FONT_SIZE,
+    fontFamily: QUESTION_FONT_FAMILY,
+    color: '#1e2430',
+    leadText: questionMarker,
+    leadFontScale: QUESTION_MARKER_SCALE,
+    leadGapPx: questionMarker ? QUESTION_MARKER_GAP_PX : 0,
+    leadBold: true,
+  }
+}
+
 function appendChoiceContentNodes(args: {
   nodes: RenderNode[]
   normalizedStem: string
@@ -1493,14 +1811,18 @@ function appendChoiceContentNodes(args: {
     includeTrailingSpace = true,
   } = args
 
-  const stemMarkdown = normalizedStem.replace(INLINE_TOKEN_REGEX, CHOICE_BLANK_TEXT)
+  const stemMarkdown = normalizedStem
   const stemSplit = splitMarkdownTextAndImages(stemMarkdown)
-  const rawStemNodes = stemSplit.textMarkdown.length > 0 ? markdownToNodes(stemSplit.textMarkdown) : []
-  const stemNodes = questionLabel
-    ? prependLabelToNodes(`${questionLabel} `, rawStemNodes, { bold: true })
-    : questionMarker
-      ? prependQuestionMarkerToNodes(questionMarker, rawStemNodes)
-      : rawStemNodes
+  const stemNodes =
+    stemSplit.textMarkdown.length > 0 || questionLabel || questionMarker
+      ? [
+          buildChoiceStemNode({
+            stemMarkdown: stemSplit.textMarkdown,
+            questionLabel,
+            questionMarker,
+          }),
+        ]
+      : []
 
   nodes.push(...stemNodes)
 
@@ -1847,14 +2169,101 @@ function buildSubjectivePlan(
   }
 }
 
+function resolveBindingSide(
+  pageNumber: number,
+  firstPageBindingSide: PdfExportSpacingConfig['firstPageBindingSide'],
+): 'left' | 'right' {
+  if (pageNumber % 2 === 1) {
+    return firstPageBindingSide
+  }
+  return firstPageBindingSide === 'left' ? 'right' : 'left'
+}
+
+function drawLooseLeafHoleGuides(
+  ctx: CanvasRenderingContext2D,
+  bindingSide: 'left' | 'right',
+  pageWidthPx: number,
+) {
+  const holeRadiusPx = mmToPx(LOOSE_LEAF_HOLE_DIAMETER_MM) / 2
+  const holeCenterOffsetPx = mmToPx(LOOSE_LEAF_HOLE_OFFSET_MM)
+  const holePitchPx = mmToPx(LOOSE_LEAF_HOLE_PITCH_MM)
+  const firstHoleCenterYPx =
+    (mmToPx(PAGE_HEIGHT_MM) - holePitchPx * (LOOSE_LEAF_HOLE_COUNT - 1)) / 2
+  const centerX = bindingSide === 'left' ? holeCenterOffsetPx : pageWidthPx - holeCenterOffsetPx
+
+  ctx.save()
+  ctx.strokeStyle = '#b7bfcc'
+  ctx.lineWidth = 1
+  for (let index = 0; index < LOOSE_LEAF_HOLE_COUNT; index += 1) {
+    const centerY = firstHoleCenterYPx + index * holePitchPx
+    ctx.beginPath()
+    ctx.arc(centerX, centerY, holeRadiusPx, 0, Math.PI * 2)
+    ctx.stroke()
+  }
+  ctx.restore()
+}
+
+function resolvePageLayout(args: {
+  pageNumber: number
+  pageWidthPx: number
+  columnWidthPx: number
+  gapPx: number
+  dividerWidthPx: number
+  baseMarginPx: number
+  bindingMarginPx: number
+  firstPageBindingSide: PdfExportSpacingConfig['firstPageBindingSide']
+}): {
+  leftX: number
+  rightX: number
+  dividerX: number
+  bindingSide: 'left' | 'right'
+} {
+  const {
+    pageNumber,
+    pageWidthPx,
+    columnWidthPx,
+    gapPx,
+    dividerWidthPx,
+    baseMarginPx,
+    bindingMarginPx,
+    firstPageBindingSide,
+  } = args
+  const bindingSide = resolveBindingSide(pageNumber, firstPageBindingSide)
+  const leftMarginPx = baseMarginPx + (bindingSide === 'left' ? bindingMarginPx : 0)
+  const rightMarginPx = baseMarginPx + (bindingSide === 'right' ? bindingMarginPx : 0)
+  const dividerX = leftMarginPx + columnWidthPx + gapPx / 2
+  const rightX = pageWidthPx - rightMarginPx - columnWidthPx
+
+  return {
+    leftX: leftMarginPx,
+    rightX,
+    dividerX: dividerX + dividerWidthPx / 2,
+    bindingSide,
+  }
+}
+
 function createPageState(args: {
   pageWidthPx: number
   pageHeightPx: number
   contentTopPx: number
   contentBottomPx: number
+  leftX: number
+  rightX: number
   dividerX: number
+  bindingSide: 'left' | 'right'
+  renderLooseLeafHoles: boolean
 }): PageState {
-  const { pageWidthPx, pageHeightPx, contentTopPx, contentBottomPx, dividerX } = args
+  const {
+    pageWidthPx,
+    pageHeightPx,
+    contentTopPx,
+    contentBottomPx,
+    leftX,
+    rightX,
+    dividerX,
+    bindingSide,
+    renderLooseLeafHoles,
+  } = args
   const canvas = document.createElement('canvas')
   canvas.width = pageWidthPx
   canvas.height = pageHeightPx
@@ -1874,10 +2283,18 @@ function createPageState(args: {
   ctx.lineTo(dividerX, contentBottomPx)
   ctx.stroke()
 
+  if (renderLooseLeafHoles) {
+    drawLooseLeafHoleGuides(ctx, bindingSide, pageWidthPx)
+  }
+
   return {
     canvas,
     ctx,
     columnY: [contentTopPx, contentTopPx],
+    leftX,
+    rightX,
+    dividerX,
+    bindingSide,
   }
 }
 
@@ -1900,19 +2317,17 @@ export async function exportQuestionsAsPdf(
 
   const pageWidthPx = Math.round(mmToPx(PAGE_WIDTH_MM))
   const pageHeightPx = Math.round(mmToPx(PAGE_HEIGHT_MM))
-  const marginPx = mmToPx(PAGE_MARGIN_MM)
-  const contentTopPx = marginPx
-  const contentBottomPx = pageHeightPx - marginPx
+  const baseMarginPx = mmToPx(PAGE_MARGIN_MM)
+  const contentTopPx = baseMarginPx
+  const contentBottomPx = pageHeightPx - baseMarginPx
   const contentHeightPx = contentBottomPx - contentTopPx
 
-  const contentWidthPx = pageWidthPx - marginPx * 2
+  const spacingConfig = options?.spacingConfig ?? DEFAULT_PDF_EXPORT_SPACING_CONFIG
+  const bindingMarginPx = mmToPx(spacingConfig.bindingMarginMm)
+  const contentWidthPx = pageWidthPx - baseMarginPx * 2 - bindingMarginPx
   const gapPx = mmToPx(COLUMN_GAP_MM)
   const dividerWidthPx = 1
   const columnWidthPx = Math.floor((contentWidthPx - gapPx - dividerWidthPx) / 2)
-
-  const leftX = marginPx
-  const rightX = marginPx + columnWidthPx + gapPx + dividerWidthPx
-  const dividerX = marginPx + columnWidthPx + gapPx / 2
 
   const measureCanvas = document.createElement('canvas')
   const measureCtx = measureCanvas.getContext('2d')
@@ -1924,7 +2339,6 @@ export async function exportQuestionsAsPdf(
   }
 
   const includeAnalysis = options?.includeAnalysis === true
-  const spacingConfig = options?.spacingConfig ?? DEFAULT_PDF_EXPORT_SPACING_CONFIG
   const [imageMap, mathAssetMap] = await Promise.all([
     buildImageMap(questions, includeAnalysis),
     buildMathAssetMap(questions, includeAnalysis),
@@ -1978,13 +2392,29 @@ export async function exportQuestionsAsPdf(
   const sortedPlans = [...plans].sort((left, right) => right.totalHeightPx - left.totalHeightPx)
 
   const pages: PageState[] = [
-    createPageState({
-      pageWidthPx,
-      pageHeightPx,
-      contentTopPx,
-      contentBottomPx,
-      dividerX,
-    }),
+    (() => {
+      const layout = resolvePageLayout({
+        pageNumber: 1,
+        pageWidthPx,
+        columnWidthPx,
+        gapPx,
+        dividerWidthPx,
+        baseMarginPx,
+        bindingMarginPx,
+        firstPageBindingSide: spacingConfig.firstPageBindingSide,
+      })
+      return createPageState({
+        pageWidthPx,
+        pageHeightPx,
+        contentTopPx,
+        contentBottomPx,
+        leftX: layout.leftX,
+        rightX: layout.rightX,
+        dividerX: layout.dividerX,
+        bindingSide: layout.bindingSide,
+        renderLooseLeafHoles: spacingConfig.renderLooseLeafHoles,
+      })
+    })(),
   ]
 
   let pageIndex = 0
@@ -2001,13 +2431,27 @@ export async function exportQuestionsAsPdf(
     }
 
     pageIndex += 1
+    const layout = resolvePageLayout({
+      pageNumber: pageIndex + 1,
+      pageWidthPx,
+      columnWidthPx,
+      gapPx,
+      dividerWidthPx,
+      baseMarginPx,
+      bindingMarginPx,
+      firstPageBindingSide: spacingConfig.firstPageBindingSide,
+    })
     pages.push(
       createPageState({
         pageWidthPx,
         pageHeightPx,
         contentTopPx,
         contentBottomPx,
-        dividerX,
+        leftX: layout.leftX,
+        rightX: layout.rightX,
+        dividerX: layout.dividerX,
+        bindingSide: layout.bindingSide,
+        renderLooseLeafHoles: spacingConfig.renderLooseLeafHoles,
       }),
     )
     columnIndex = 0
@@ -2015,7 +2459,7 @@ export async function exportQuestionsAsPdf(
 
   const drawBlockOnCurrentColumn = (block: RenderBlock) => {
     const page = currentPage()
-    const x = columnIndex === 0 ? leftX : rightX
+    const x = columnIndex === 0 ? page.leftX : page.rightX
     const y = page.columnY[columnIndex]
 
     const endY = layoutAndDrawNodes({
@@ -2249,13 +2693,27 @@ export async function exportQuestionsAsPdf(
     if (plan.totalHeightPx > capacityWithoutPageBreak && plan.totalHeightPx <= contentHeightPx * 2) {
       if (!(columnIndex === 0 && currentPage().columnY[0] === contentTopPx && currentPage().columnY[1] === contentTopPx)) {
         pageIndex += 1
+        const layout = resolvePageLayout({
+          pageNumber: pageIndex + 1,
+          pageWidthPx,
+          columnWidthPx,
+          gapPx,
+          dividerWidthPx,
+          baseMarginPx,
+          bindingMarginPx,
+          firstPageBindingSide: spacingConfig.firstPageBindingSide,
+        })
         pages.push(
           createPageState({
             pageWidthPx,
             pageHeightPx,
             contentTopPx,
             contentBottomPx,
-            dividerX,
+            leftX: layout.leftX,
+            rightX: layout.rightX,
+            dividerX: layout.dividerX,
+            bindingSide: layout.bindingSide,
+            renderLooseLeafHoles: spacingConfig.renderLooseLeafHoles,
           }),
         )
         columnIndex = 0

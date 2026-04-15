@@ -10,7 +10,7 @@ interface ExportConfigModalProps {
   targetLabel: string
   exporting: boolean
   config: PdfExportSpacingConfig
-  onChange: (key: keyof PdfExportSpacingConfig, value: number) => void
+  onChange: <K extends keyof PdfExportSpacingConfig>(key: K, value: PdfExportSpacingConfig[K]) => void
   onClose: () => void
   onReset: () => void
   onSave: () => void
@@ -73,6 +73,39 @@ function ExportConfigModal({
           </p>
         </div>
 
+        <div className="export-config-section">
+          <h4>打印与装订</h4>
+          <div className="export-config-grid export-config-grid--compact">
+            <label>
+              <span>第一页装订侧</span>
+              <select
+                value={config.firstPageBindingSide}
+                onChange={(event) =>
+                  onChange('firstPageBindingSide', event.target.value === 'right' ? 'right' : 'left')
+                }
+              >
+                <option value="left">左侧装订</option>
+                <option value="right">右侧装订</option>
+              </select>
+              <small>奇偶页会自动交替，默认第一页按左侧装订处理。</small>
+            </label>
+
+            <label className="export-config-toggle">
+              <span>输出活页孔位</span>
+              <input
+                type="checkbox"
+                checked={config.renderLooseLeafHoles}
+                onChange={(event) => onChange('renderLooseLeafHoles', event.target.checked)}
+              />
+              <small>
+                按 B5 26 孔活页绘制孔位标记，便于打印后打孔或核对位置。
+              </small>
+            </label>
+          </div>
+        </div>
+
+        <div className="export-config-section">
+          <h4>题目留白</h4>
         <div className="export-config-grid">
           {PDF_EXPORT_SPACING_FIELDS.map((field) => {
             const currentValue = config[field.key]
@@ -94,6 +127,7 @@ function ExportConfigModal({
               </label>
             )
           })}
+        </div>
         </div>
 
         <footer className="modal-actions">

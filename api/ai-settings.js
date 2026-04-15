@@ -23,6 +23,49 @@ function normalizeSettings(raw) {
   }
 }
 
+function normalizeTimestamp(value) {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return null
+  }
+
+  const timestamp = Date.parse(trimmed)
+  if (Number.isNaN(timestamp)) {
+    return null
+  }
+
+  return new Date(timestamp).toISOString()
+}
+
+function normalizeSettingsRecord(raw, exists = true) {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      settings: { ...DEFAULT_SETTINGS },
+      updatedAt: null,
+      exists,
+    }
+  }
+
+  const source = raw
+  if (source.settings && typeof source.settings === 'object') {
+    return {
+      settings: normalizeSettings(source.settings),
+      updatedAt: normalizeTimestamp(source.updatedAt),
+      exists,
+    }
+  }
+
+  return {
+    settings: normalizeSettings(source),
+    updatedAt: null,
+    exists,
+  }
+}
+
 function buildJsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -93,21 +136,36 @@ async function loadSettingsFromKv() {
   const payload = await callKv(`get/${encodeURIComponent(KV_KEY)}`, 'GET')
   const rawResult = payload && typeof payload === 'object' ? payload.result : null
   if (typeof rawResult !== 'string' || rawResult.trim().length === 0) {
-    return { ...DEFAULT_SETTINGS }
+    return {
+      settings: { ...DEFAULT_SETTINGS },
+      updatedAt: null,
+      exists: false,
+    }
   }
 
   try {
-    return normalizeSettings(JSON.parse(rawResult))
+    return normalizeSettingsRecord(JSON.parse(rawResult), true)
   } catch {
-    return { ...DEFAULT_SETTINGS }
+    return {
+      settings: { ...DEFAULT_SETTINGS },
+      updatedAt: null,
+      exists: false,
+    }
   }
 }
 
-async function saveSettingsToKv(settings) {
-  const normalized = normalizeSettings(settings)
-  const encoded = encodeURIComponent(JSON.stringify(normalized))
+async function saveSettingsToKv(rawInput) {
+  const normalized = normalizeSettingsRecord(rawInput, true)
+  const record = {
+    settings: normalized.settings,
+    updatedAt: normalized.updatedAt || new Date().toISOString(),
+  }
+  const encoded = encodeURIComponent(JSON.stringify(record))
   await callKv(`set/${encodeURIComponent(KV_KEY)}/${encoded}`, 'POST')
-  return normalized
+  return {
+    ...record,
+    exists: true,
+  }
 }
 
 export default async function handler(request) {
@@ -118,7 +176,7 @@ export default async function handler(request) {
   try {
     if (request.method === 'GET') {
       const settings = await loadSettingsFromKv()
-      return buildJsonResponse({ settings })
+      return buildJsonResponse(settings)
     }
 
     if (request.method === 'PUT' || request.method === 'POST') {
@@ -129,12 +187,8 @@ export default async function handler(request) {
         return buildJsonResponse({ message: '请求体必须是 JSON。' }, 400)
       }
 
-      const rawSettings =
-        body && typeof body === 'object' && body.settings && typeof body.settings === 'object'
-          ? body.settings
-          : body
-      const settings = await saveSettingsToKv(rawSettings)
-      return buildJsonResponse({ settings })
+      const settings = await saveSettingsToKv(body)
+      return buildJsonResponse(settings)
     }
 
     return buildJsonResponse({ message: '仅支持 GET / PUT / POST / OPTIONS。' }, 405)
