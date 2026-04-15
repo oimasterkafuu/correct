@@ -77,12 +77,20 @@ type ChatContentPart = { type: 'text'; text: string } | { type: 'image_url'; ima
 type ChatMessageContent = string | ChatContentPart[]
 
 const QUESTIONS_KEY = 'mistakes.questions.v1'
+const QUESTIONS_SNAPSHOT_LOCAL_STORAGE_KEY = 'mistakes.questions.snapshot.v1'
 const LAST_CREATED_SUBJECT_KEY = 'mistakes.last-created-subject.v1'
 const AI_SETTINGS_LOCAL_STORAGE_KEY = 'mistakes.ai-settings.snapshot.v1'
+const QUESTIONS_CLOUD_URL = import.meta.env.VITE_QUESTIONS_URL?.trim() || '/api/questions'
+const QUESTIONS_CLOUD_TOKEN =
+  import.meta.env.VITE_QUESTIONS_TOKEN?.trim() || import.meta.env.VITE_AI_SETTINGS_TOKEN?.trim() || ''
+const QUESTIONS_CLOUD_SAVE_METHOD =
+  import.meta.env.VITE_QUESTIONS_SAVE_METHOD?.trim().toUpperCase() || 'PUT'
 const AI_SETTINGS_CLOUD_URL = import.meta.env.VITE_AI_SETTINGS_URL?.trim() || '/api/ai-settings'
 const AI_SETTINGS_CLOUD_TOKEN = import.meta.env.VITE_AI_SETTINGS_TOKEN?.trim() || ''
 const AI_SETTINGS_CLOUD_SAVE_METHOD =
   import.meta.env.VITE_AI_SETTINGS_SAVE_METHOD?.trim().toUpperCase() || 'PUT'
+const MCP_SERVER_URL = import.meta.env.VITE_MCP_URL?.trim() || '/api/mcp'
+const MCP_SERVER_TOKEN = import.meta.env.VITE_MCP_TOKEN?.trim() || QUESTIONS_CLOUD_TOKEN
 
 const INITIAL_AI_SETTINGS: AiSettings = {
   enabled: true,
@@ -101,10 +109,52 @@ interface ComparableAiSettingsSnapshot {
   updatedAt: string | null
 }
 
+interface QuestionSnapshot {
+  questions: Question[]
+  updatedAt: string
+}
+
+interface ComparableQuestionSnapshot {
+  questions: Question[]
+  updatedAt: string | null
+}
+
 interface ParsedAiSettingsCloudPayload {
   exists: boolean
   snapshot: ComparableAiSettingsSnapshot | null
 }
+
+interface ParsedQuestionCloudPayload {
+  exists: boolean
+  snapshot: ComparableQuestionSnapshot | null
+}
+
+interface McpToolMetadata {
+  name: string
+  description: string
+}
+
+interface McpResourceMetadata {
+  uri?: string
+  uriTemplate?: string
+  name: string
+  description?: string
+}
+
+interface McpServerMetadata {
+  name: string
+  version: string
+  protocol: string
+  endpoint: string
+  authRequired: boolean
+  capabilities: {
+    tools: McpToolMetadata[]
+    staticResources: McpResourceMetadata[]
+    resourceTemplates: McpResourceMetadata[]
+  }
+}
+
+type QuestionStateUpdater = Question[] | ((prev: Question[]) => Question[])
 
 const QUESTION_TYPE_LABEL: Record<QuestionType, string> = {
   choice: '选择题',
@@ -1335,6 +1385,185 @@ function hydrateQuestions(input: unknown): Question[] {
     .filter((item): item is Question => item !== null)
 }
 
+function parseQuestionsSnapshotLike(payload: unknown): ComparableQuestionSnapshot | null {
+  if (Array.isArray(payload)) {
+    return {
+      questions: hydrateQuestions(payload),
+      updatedAt: null,
+    }
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const root = payload as Record<string, unknown>
+
+  if (root.snapshot && typeof root.snapshot === 'object') {
+    const parsed = parseQuestionsSnapshotLike(root.snapshot)
+    if (parsed) {
+      return parsed
+    }
+  }
+
+  if (root.data && typeof root.data === 'object') {
+    const parsed = parseQuestionsSnapshotLike(root.data)
+    if (parsed) {
+      return parsed
+    }
+  }
+
+  if (Array.isArray(root.questions)) {
+    return {
+      questions: hydrateQuestions(root.questions),
+      updatedAt: normalizeTimestamp(root.updatedAt),
+    }
+  }
+
+  return null
+}
+
+function parseQuestionsCloudPayload(payload: unknown): ParsedQuestionCloudPayload | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const source = payload as Record<string, unknown>
+  const snapshot = parseQuestionsSnapshotLike(payload)
+  const exists = typeof source.exists === 'boolean' ? source.exists : snapshot !== null
+  return {
+    exists,
+    snapshot: exists ? snapshot : null,
+  }
+}
+
+function loadQuestionSnapshotFromLocalStorage(): ComparableQuestionSnapshot | null {
+  const cachedSnapshot = fromLocalStorage<unknown | null>(QUESTIONS_SNAPSHOT_LOCAL_STORAGE_KEY, null)
+  const parsedSnapshot = parseQuestionsSnapshotLike(cachedSnapshot)
+  if (parsedSnapshot) {
+    return parsedSnapshot
+  }
+
+  const cachedQuestions = fromLocalStorage<unknown | null>(QUESTIONS_KEY, null)
+  return parseQuestionsSnapshotLike(cachedQuestions)
+}
+
+function saveQuestionSnapshotToLocalStorage(snapshot: QuestionSnapshot): void {
+  toLocalStorage(QUESTIONS_KEY, snapshot.questions)
+  toLocalStorage(QUESTIONS_SNAPSHOT_LOCAL_STORAGE_KEY, snapshot)
+}
+
+function materializeQuestionSnapshot(snapshot: ComparableQuestionSnapshot): QuestionSnapshot {
+  return {
+    questions: hydrateQuestions(snapshot.questions),
+    updatedAt: snapshot.updatedAt ?? new Date().toISOString(),
+  }
+}
+
+function getQuestionSnapshotTime(snapshot: ComparableQuestionSnapshot | null): number {
+  if (!snapshot?.updatedAt) {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  const timestamp = Date.parse(snapshot.updatedAt)
+  return Number.isNaN(timestamp) ? Number.NEGATIVE_INFINITY : timestamp
+}
+
+function compareQuestionSnapshots(
+  left: ComparableQuestionSnapshot | null,
+  right: ComparableQuestionSnapshot | null,
+): number {
+  return getQuestionSnapshotTime(left) - getQuestionSnapshotTime(right)
+}
+
+function serializeQuestionSnapshot(snapshot: ComparableQuestionSnapshot | null): string | null {
+  if (!snapshot) {
+    return null
+  }
+
+  return JSON.stringify({
+    updatedAt: snapshot.updatedAt ?? null,
+    questions: snapshot.questions,
+  })
+}
+
+function areQuestionSnapshotsEqual(
+  left: ComparableQuestionSnapshot | null,
+  right: ComparableQuestionSnapshot | null,
+): boolean {
+  return serializeQuestionSnapshot(left) === serializeQuestionSnapshot(right)
+}
+
+function parseMcpServerMetadata(payload: unknown): McpServerMetadata | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const source = payload as Record<string, unknown>
+  const capabilitiesSource =
+    source.capabilities && typeof source.capabilities === 'object'
+      ? (source.capabilities as Record<string, unknown>)
+      : null
+
+  const tools = Array.isArray(capabilitiesSource?.tools)
+    ? capabilitiesSource.tools
+        .map((item) => {
+          if (!item || typeof item !== 'object') {
+            return null
+          }
+          const tool = item as Record<string, unknown>
+          return {
+            name: typeof tool.name === 'string' ? tool.name : '',
+            description: typeof tool.description === 'string' ? tool.description : '',
+          }
+        })
+        .filter((item): item is McpToolMetadata => item !== null && item.name.length > 0)
+    : []
+
+  const parseResourceList = (value: unknown): McpResourceMetadata[] => {
+    if (!Array.isArray(value)) {
+      return []
+    }
+
+    const items: Array<McpResourceMetadata | null> = value.map((item) => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+
+      const resource = item as Record<string, unknown>
+      const name = typeof resource.name === 'string' ? resource.name : ''
+      if (!name) {
+        return null
+      }
+
+      return {
+        name,
+        description: typeof resource.description === 'string' ? resource.description : undefined,
+        uri: typeof resource.uri === 'string' ? resource.uri : undefined,
+        uriTemplate: typeof resource.uriTemplate === 'string' ? resource.uriTemplate : undefined,
+      }
+    })
+
+    return items.filter((item): item is McpResourceMetadata => item !== null)
+  }
+
+  return {
+    name: typeof source.name === 'string' ? source.name : 'correct-mcp',
+    version: typeof source.version === 'string' ? source.version : 'unknown',
+    protocol: typeof source.protocol === 'string' ? source.protocol : 'MCP',
+    endpoint: typeof source.endpoint === 'string' ? source.endpoint : MCP_SERVER_URL,
+    authRequired: Boolean(source.authRequired),
+    capabilities: {
+      tools,
+      staticResources: parseResourceList(capabilitiesSource?.staticResources),
+      resourceTemplates: parseResourceList(capabilitiesSource?.resourceTemplates),
+    },
+  }
+}
+
+const INITIAL_LOCAL_QUESTION_SNAPSHOT =
+  typeof window !== 'undefined' ? loadQuestionSnapshotFromLocalStorage() : null
+
 function App() {
   const today = getTodayDateKey()
   const location = useLocation()
@@ -1350,7 +1579,13 @@ function App() {
     INITIAL_LOCAL_AI_SETTINGS_SNAPSHOT?.updatedAt ?? null,
   )
   const [questions, setQuestions] = useState<Question[]>(() =>
-    hydrateQuestions(fromLocalStorage(QUESTIONS_KEY, [])),
+    INITIAL_LOCAL_QUESTION_SNAPSHOT?.questions ?? hydrateQuestions(fromLocalStorage(QUESTIONS_KEY, [])),
+  )
+  const [questionsLoaded, setQuestionsLoaded] = useState(false)
+  const [questionsSyncing, setQuestionsSyncing] = useState(false)
+  const [questionsSaving, setQuestionsSaving] = useState(false)
+  const [questionsSyncedAt, setQuestionsSyncedAt] = useState<string | null>(
+    INITIAL_LOCAL_QUESTION_SNAPSHOT?.updatedAt ?? null,
   )
   const [draft, setDraft] = useState<DraftState>(() => ({
     ...createInitialDraft(),
@@ -1371,11 +1606,16 @@ function App() {
   const [endDate, setEndDate] = useState(today)
   const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [mcpMetadata, setMcpMetadata] = useState<McpServerMetadata | null>(null)
+  const [mcpMetadataLoading, setMcpMetadataLoading] = useState(false)
 
   const imageMemoryRef = useRef<Record<string, string>>({})
   const imageIdByDataUrlRef = useRef<Record<string, string>>({})
   const blobUrlByDataUrlRef = useRef<Record<string, string>>({})
   const imageIndexRef = useRef(1)
+  const questionCloudSnapshotRef = useRef<string | null>(
+    serializeQuestionSnapshot(INITIAL_LOCAL_QUESTION_SNAPSHOT),
+  )
 
   const rememberImageInMemory = useCallback((dataUrl: string): string => {
     const existingId = imageIdByDataUrlRef.current[dataUrl]
@@ -1614,9 +1854,176 @@ function App() {
     }
   }, [settings])
 
+  const updateQuestions = useCallback((updater: QuestionStateUpdater) => {
+    const updatedAt = new Date().toISOString()
+    setQuestions((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater
+      return hydrateQuestions(next)
+    })
+    setQuestionsSyncedAt(updatedAt)
+  }, [])
+
+  const syncQuestionsFromCloud = useCallback(
+    async (showSuccessNotice = false, showErrorNotice = true) => {
+      setQuestionsSyncing(true)
+      const localSnapshot = loadQuestionSnapshotFromLocalStorage()
+
+      try {
+        const headers: HeadersInit = {}
+        if (QUESTIONS_CLOUD_TOKEN) {
+          headers.Authorization = `Bearer ${QUESTIONS_CLOUD_TOKEN}`
+        }
+
+        const response = await fetch(QUESTIONS_CLOUD_URL, {
+          method: 'GET',
+          headers,
+        })
+        const payload = await parseCloudResponseJson(response)
+        if (!response.ok) {
+          const detail = getPayloadMessage(payload)
+          throw new Error(detail || `题库云端拉取失败（HTTP ${response.status}）`)
+        }
+
+        const parsed = parseQuestionsCloudPayload(payload)
+        if (!parsed) {
+          throw new Error('题库云端返回格式错误，请检查接口返回。')
+        }
+
+        const cloudSnapshot = parsed.snapshot
+        const chosenSnapshotSource =
+          localSnapshot && cloudSnapshot
+            ? compareQuestionSnapshots(localSnapshot, cloudSnapshot) > 0
+              ? localSnapshot
+              : cloudSnapshot
+            : localSnapshot ?? cloudSnapshot
+
+        const resolvedSnapshot = chosenSnapshotSource ? materializeQuestionSnapshot(chosenSnapshotSource) : null
+        const localNeedsSync =
+          resolvedSnapshot !== null && !areQuestionSnapshotsEqual(localSnapshot, resolvedSnapshot)
+        const cloudNeedsSync =
+          resolvedSnapshot !== null && (!parsed.exists || !areQuestionSnapshotsEqual(cloudSnapshot, resolvedSnapshot))
+
+        let finalSnapshot = resolvedSnapshot
+        if (resolvedSnapshot && cloudNeedsSync) {
+          const syncHeaders: HeadersInit = {
+            'Content-Type': 'application/json',
+          }
+          if (QUESTIONS_CLOUD_TOKEN) {
+            syncHeaders.Authorization = `Bearer ${QUESTIONS_CLOUD_TOKEN}`
+          }
+
+          const saveResponse = await fetch(QUESTIONS_CLOUD_URL, {
+            method: QUESTIONS_CLOUD_SAVE_METHOD,
+            headers: syncHeaders,
+            body: JSON.stringify(resolvedSnapshot),
+          })
+          const savePayload = await parseCloudResponseJson(saveResponse)
+          if (!saveResponse.ok) {
+            const detail = getPayloadMessage(savePayload)
+            throw new Error(detail || `题库云端保存失败（HTTP ${saveResponse.status}）`)
+          }
+
+          const saved = parseQuestionsCloudPayload(savePayload)
+          if (!saved?.snapshot) {
+            throw new Error('题库云端保存后返回格式错误，请检查接口返回。')
+          }
+
+          finalSnapshot = materializeQuestionSnapshot(saved.snapshot)
+        }
+
+        if (finalSnapshot && (localNeedsSync || cloudNeedsSync)) {
+          saveQuestionSnapshotToLocalStorage(finalSnapshot)
+        }
+
+        questionCloudSnapshotRef.current = serializeQuestionSnapshot(finalSnapshot)
+        setQuestions(finalSnapshot?.questions ?? [])
+        setQuestionsSyncedAt(finalSnapshot?.updatedAt ?? null)
+
+        if (showSuccessNotice) {
+          if (finalSnapshot && cloudNeedsSync && !parsed.exists) {
+            setNotice('检测到云端题库缺失，已用本地版本自动修复并同步。')
+          } else if (finalSnapshot && cloudNeedsSync) {
+            setNotice('已按较新版本完成题库双向同步。')
+          } else if (finalSnapshot && localNeedsSync) {
+            setNotice('已从云端同步题库并写入本地缓存。')
+          } else {
+            setNotice('已从云端同步题库。')
+          }
+        }
+      } catch (error) {
+        if (localSnapshot) {
+          const fallbackSnapshot = materializeQuestionSnapshot(localSnapshot)
+          saveQuestionSnapshotToLocalStorage(fallbackSnapshot)
+          questionCloudSnapshotRef.current = serializeQuestionSnapshot(fallbackSnapshot)
+          setQuestions(fallbackSnapshot.questions)
+          setQuestionsSyncedAt(fallbackSnapshot.updatedAt)
+        }
+
+        if (showErrorNotice) {
+          const message = error instanceof Error ? error.message : '题库云端拉取失败'
+          setNotice(localSnapshot ? `${message}，已回退到本地题库。` : message)
+        }
+      } finally {
+        setQuestionsSyncing(false)
+        setQuestionsLoaded(true)
+      }
+    },
+    [],
+  )
+
+  const fetchMcpMetadata = useCallback(
+    async (showSuccessNotice = false, showErrorNotice = false) => {
+      setMcpMetadataLoading(true)
+
+      try {
+        const headers: HeadersInit = {}
+        if (MCP_SERVER_TOKEN) {
+          headers.Authorization = `Bearer ${MCP_SERVER_TOKEN}`
+        }
+
+        const response = await fetch(MCP_SERVER_URL, {
+          method: 'GET',
+          headers,
+        })
+        const payload = await parseCloudResponseJson(response)
+        if (!response.ok) {
+          const detail = getPayloadMessage(payload)
+          throw new Error(detail || `MCP 信息读取失败（HTTP ${response.status}）`)
+        }
+
+        const parsed = parseMcpServerMetadata(payload)
+        if (!parsed) {
+          throw new Error('MCP 服务返回格式错误。')
+        }
+
+        setMcpMetadata(parsed)
+        if (showSuccessNotice) {
+          setNotice('MCP 接入信息已刷新。')
+        }
+      } catch (error) {
+        setMcpMetadata(null)
+        if (showErrorNotice) {
+          const message = error instanceof Error ? error.message : 'MCP 信息读取失败'
+          setNotice(message)
+        }
+      } finally {
+        setMcpMetadataLoading(false)
+      }
+    },
+    [],
+  )
+
   useEffect(() => {
     void syncAiSettingsFromCloud(false, false)
   }, [syncAiSettingsFromCloud])
+
+  useEffect(() => {
+    void syncQuestionsFromCloud(false, false)
+  }, [syncQuestionsFromCloud])
+
+  useEffect(() => {
+    void fetchMcpMetadata(false, false)
+  }, [fetchMcpMetadata])
 
   const pathname = location.pathname
   const pathnameLower = pathname.toLowerCase()
@@ -1672,9 +2079,122 @@ function App() {
     [bankList, resolveMarkdownForRender],
   )
 
+  const mcpToolSummary = useMemo(() => {
+    if (!mcpMetadata || mcpMetadata.capabilities.tools.length === 0) {
+      return '暂无可读取的 MCP 工具信息。'
+    }
+
+    return mcpMetadata.capabilities.tools
+      .map((tool) => `${tool.name}：${tool.description || '未提供描述'}`)
+      .join('\n')
+  }, [mcpMetadata])
+
+  const mcpResourceSummary = useMemo(() => {
+    if (!mcpMetadata) {
+      return '暂无可读取的 MCP 资源信息。'
+    }
+
+    const lines = [
+      ...mcpMetadata.capabilities.staticResources.map(
+        (resource) => `${resource.uri ?? resource.name}：${resource.description || '未提供描述'}`,
+      ),
+      ...mcpMetadata.capabilities.resourceTemplates.map(
+        (resource) =>
+          `${resource.uriTemplate ?? resource.name}：${resource.description || '未提供描述'}`,
+      ),
+    ]
+
+    return lines.length > 0 ? lines.join('\n') : '暂无可读取的 MCP 资源信息。'
+  }, [mcpMetadata])
+
   useEffect(() => {
-    toLocalStorage(QUESTIONS_KEY, questions)
-  }, [questions])
+    if (!questionsLoaded && INITIAL_LOCAL_QUESTION_SNAPSHOT === null) {
+      return
+    }
+    if (questionsSyncedAt === null && INITIAL_LOCAL_QUESTION_SNAPSHOT === null && questions.length === 0) {
+      return
+    }
+
+    saveQuestionSnapshotToLocalStorage(
+      materializeQuestionSnapshot({
+        questions,
+        updatedAt: questionsSyncedAt,
+      }),
+    )
+  }, [questions, questionsLoaded, questionsSyncedAt])
+
+  useEffect(() => {
+    if (!questionsLoaded || questionsSyncing) {
+      return
+    }
+    if (questionsSyncedAt === null && INITIAL_LOCAL_QUESTION_SNAPSHOT === null && questions.length === 0) {
+      return
+    }
+
+    const localSnapshot = materializeQuestionSnapshot({
+      questions,
+      updatedAt: questionsSyncedAt,
+    })
+    const serializedSnapshot = serializeQuestionSnapshot(localSnapshot)
+    if (serializedSnapshot === questionCloudSnapshotRef.current) {
+      return
+    }
+
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        setQuestionsSaving(true)
+        try {
+          const headers: HeadersInit = {
+            'Content-Type': 'application/json',
+          }
+          if (QUESTIONS_CLOUD_TOKEN) {
+            headers.Authorization = `Bearer ${QUESTIONS_CLOUD_TOKEN}`
+          }
+
+          const response = await fetch(QUESTIONS_CLOUD_URL, {
+            method: QUESTIONS_CLOUD_SAVE_METHOD,
+            headers,
+            body: JSON.stringify(localSnapshot),
+          })
+          const payload = await parseCloudResponseJson(response)
+          if (!response.ok) {
+            const detail = getPayloadMessage(payload)
+            throw new Error(detail || `题库云端保存失败（HTTP ${response.status}）`)
+          }
+
+          const parsed = parseQuestionsCloudPayload(payload)
+          const savedSnapshot = parsed?.snapshot
+            ? materializeQuestionSnapshot(parsed.snapshot)
+            : localSnapshot
+
+          questionCloudSnapshotRef.current = serializeQuestionSnapshot(savedSnapshot)
+          saveQuestionSnapshotToLocalStorage(savedSnapshot)
+
+          if (!cancelled) {
+            setQuestionsSyncedAt(savedSnapshot.updatedAt)
+            if (!areQuestionSnapshotsEqual(savedSnapshot, localSnapshot)) {
+              setQuestions(savedSnapshot.questions)
+            }
+          }
+        } catch (error) {
+          if (!cancelled) {
+            const message = error instanceof Error ? error.message : '题库云端保存失败'
+            setNotice(`${message}，题库已保存在本地缓存，可稍后手动同步。`)
+          }
+        } finally {
+          if (!cancelled) {
+            setQuestionsSaving(false)
+          }
+        }
+      })()
+    }, 700)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [questions, questionsLoaded, questionsSyncedAt, questionsSyncing])
 
   useEffect(() => {
     if (!aiSettingsLoaded) {
@@ -2012,7 +2532,7 @@ function App() {
       return
     }
 
-    setQuestions((prev) => prev.filter((item) => item.id !== questionId))
+    updateQuestions((prev) => prev.filter((item) => item.id !== questionId))
     if (editingQuestionId === questionId || editPathQuestionId === questionId) {
       setEditingQuestionId(null)
       navigate('/create', { replace: true })
@@ -2072,7 +2592,7 @@ function App() {
         analysis: materializeMarkdownForStorage(draft.choiceAnalysis.trim()),
       }
 
-      setQuestions((prev) =>
+      updateQuestions((prev) =>
         originalQuestion
           ? prev.map((item) => (item.id === questionId ? nextQuestion : item))
           : [nextQuestion, ...prev],
@@ -2174,7 +2694,7 @@ function App() {
         })),
       }
 
-      setQuestions((prev) =>
+      updateQuestions((prev) =>
         originalQuestion
           ? prev.map((item) => (item.id === questionId ? nextQuestion : item))
           : [nextQuestion, ...prev],
@@ -2242,7 +2762,7 @@ function App() {
         analysis: materializeMarkdownForStorage(draft.fillAnalysis.trim()),
       }
 
-      setQuestions((prev) =>
+      updateQuestions((prev) =>
         originalQuestion
           ? prev.map((item) => (item.id === questionId ? nextQuestion : item))
           : [nextQuestion, ...prev],
@@ -2289,7 +2809,7 @@ function App() {
       analysis: materializeMarkdownForStorage(draft.subjectiveAnalysis.trim()),
     }
 
-    setQuestions((prev) =>
+    updateQuestions((prev) =>
       originalQuestion
         ? prev.map((item) => (item.id === questionId ? nextQuestion : item))
         : [nextQuestion, ...prev],
@@ -2964,98 +3484,200 @@ function App() {
           ) : null}
 
           {currentTab === 'settings' ? (
-            <section className="pane">
-              <header className="pane-head">
-                <h2>AI 设置</h2>
-                <p>启动时会比较云端与本地缓存版本，优先使用时间戳较新的配置，并自动回写较旧的一侧。</p>
-              </header>
+            <>
+              <section className="pane">
+                <header className="pane-head">
+                  <h2>AI 设置</h2>
+                  <p>启动时会比较云端与本地缓存版本，优先使用时间戳较新的配置，并自动回写较旧的一侧。</p>
+                </header>
 
-              <div className="settings-grid">
-                <label>
-                  云端配置地址
-                  <input type="text" value={AI_SETTINGS_CLOUD_URL} readOnly />
-                </label>
+                <div className="settings-grid">
+                  <label>
+                    云端配置地址
+                    <input type="text" value={AI_SETTINGS_CLOUD_URL} readOnly />
+                  </label>
 
-                <label>
-                  Base URL
-                  <input
-                    type="text"
-                    value={settings.baseUrl}
-                    placeholder="例如 https://api.openai.com/v1"
-                    onChange={(event) =>
-                      setSettings((prev) => ({
-                        ...prev,
-                        baseUrl: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
+                  <label>
+                    Base URL
+                    <input
+                      type="text"
+                      value={settings.baseUrl}
+                      placeholder="例如 https://api.openai.com/v1"
+                      onChange={(event) =>
+                        setSettings((prev) => ({
+                          ...prev,
+                          baseUrl: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
 
-                <label>
-                  API Key
-                  <input
-                    type="password"
-                    value={settings.apiKey}
-                    placeholder="sk-..."
-                    onChange={(event) =>
-                      setSettings((prev) => ({
-                        ...prev,
-                        apiKey: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
+                  <label>
+                    API Key
+                    <input
+                      type="password"
+                      value={settings.apiKey}
+                      placeholder="sk-..."
+                      onChange={(event) =>
+                        setSettings((prev) => ({
+                          ...prev,
+                          apiKey: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
 
-                <label>
-                  模型名称
-                  <input
-                    type="text"
-                    value={settings.model}
-                    placeholder="例如 gpt-4o-mini 或其它兼容模型"
-                    onChange={(event) =>
-                      setSettings((prev) => ({
-                        ...prev,
-                        model: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
-              </div>
+                  <label>
+                    模型名称
+                    <input
+                      type="text"
+                      value={settings.model}
+                      placeholder="例如 gpt-4o-mini 或其它兼容模型"
+                      onChange={(event) =>
+                        setSettings((prev) => ({
+                          ...prev,
+                          model: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
 
-              <div className="settings-actions">
-                <button
-                  type="button"
-                  className="primary-btn"
-                  onClick={() => void saveAiSettingsToCloud()}
-                  disabled={aiSettingsSyncing || aiSettingsSaving}
-                >
-                  {aiSettingsSaving ? '保存中...' : '保存到云端'}
-                </button>
-                <button
-                  type="button"
-                  className="ghost-btn"
-                  onClick={() => void syncAiSettingsFromCloud(true)}
-                  disabled={aiSettingsSyncing || aiSettingsSaving}
-                >
-                  {aiSettingsSyncing ? '同步中...' : '从云端重新拉取'}
-                </button>
-                <p className={aiConfigured ? 'status-ok' : 'status-warn'}>
-                  当前状态：
-                  {aiSettingsSyncing
-                    ? '同步中'
-                    : aiSettingsSaving
-                      ? '保存中'
-                      : !aiSettingsLoaded
-                        ? '初始化中'
-                        : aiConfigured
-                          ? '可用'
-                          : '不可用'}
-                </p>
-                <p className="hint">
-                  最近同步：{aiSettingsSyncedAt ? formatDateTime(aiSettingsSyncedAt) : '尚未成功同步'}
-                </p>
-              </div>
-            </section>
+                <div className="settings-actions">
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={() => void saveAiSettingsToCloud()}
+                    disabled={aiSettingsSyncing || aiSettingsSaving}
+                  >
+                    {aiSettingsSaving ? '保存中...' : '保存到云端'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => void syncAiSettingsFromCloud(true)}
+                    disabled={aiSettingsSyncing || aiSettingsSaving}
+                  >
+                    {aiSettingsSyncing ? '同步中...' : '从云端重新拉取'}
+                  </button>
+                  <p className={aiConfigured ? 'status-ok' : 'status-warn'}>
+                    当前状态：
+                    {aiSettingsSyncing
+                      ? '同步中'
+                      : aiSettingsSaving
+                        ? '保存中'
+                        : !aiSettingsLoaded
+                          ? '初始化中'
+                          : aiConfigured
+                            ? '可用'
+                            : '不可用'}
+                  </p>
+                  <p className="hint">
+                    最近同步：{aiSettingsSyncedAt ? formatDateTime(aiSettingsSyncedAt) : '尚未成功同步'}
+                  </p>
+                </div>
+              </section>
+
+              <section className="pane">
+                <header className="pane-head">
+                  <h2>题库云端同步</h2>
+                  <p>网页端和 AI Agent 共用这一份题库快照，启动时也会自动完成新旧版本对齐。</p>
+                </header>
+
+                <div className="settings-grid">
+                  <label>
+                    题库云端地址
+                    <input type="text" value={QUESTIONS_CLOUD_URL} readOnly />
+                  </label>
+
+                  <label>
+                    当前题目数量
+                    <input type="text" value={String(questions.length)} readOnly />
+                  </label>
+                </div>
+
+                <div className="settings-actions">
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => void syncQuestionsFromCloud(true)}
+                    disabled={questionsSyncing || questionsSaving}
+                  >
+                    {questionsSyncing ? '同步中...' : '从云端重新拉取'}
+                  </button>
+                  <p className={questionsLoaded ? 'status-ok' : 'status-warn'}>
+                    当前状态：
+                    {questionsSyncing
+                      ? '同步中'
+                      : questionsSaving
+                        ? '回写云端中'
+                        : !questionsLoaded
+                          ? '初始化中'
+                          : '已就绪'}
+                  </p>
+                  <p className="hint">
+                    最近同步：{questionsSyncedAt ? formatDateTime(questionsSyncedAt) : '尚未成功同步'}
+                  </p>
+                </div>
+              </section>
+
+              <section className="pane">
+                <header className="pane-head">
+                  <h2>MCP 接入</h2>
+                  <p>Agent 可通过标准 MCP JSON-RPC 直连题库；后续新增能力也会继续挂在同一套工具注册层里。</p>
+                </header>
+
+                <div className="settings-grid">
+                  <label>
+                    MCP 服务地址
+                    <input type="text" value={mcpMetadata?.endpoint ?? MCP_SERVER_URL} readOnly />
+                  </label>
+
+                  <label>
+                    鉴权方式
+                    <input
+                      type="text"
+                      value={
+                        mcpMetadata
+                          ? mcpMetadata.authRequired
+                            ? 'Bearer Token'
+                            : '无需鉴权'
+                          : '读取中'
+                      }
+                      readOnly
+                    />
+                  </label>
+
+                  <label className="settings-textarea-field">
+                    已暴露工具
+                    <textarea value={mcpToolSummary} readOnly rows={6} />
+                  </label>
+
+                  <label className="settings-textarea-field">
+                    资源入口
+                    <textarea value={mcpResourceSummary} readOnly rows={6} />
+                  </label>
+                </div>
+
+                <div className="settings-actions">
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => void fetchMcpMetadata(true, true)}
+                    disabled={mcpMetadataLoading}
+                  >
+                    {mcpMetadataLoading ? '读取中...' : '刷新 MCP 信息'}
+                  </button>
+                  <p className={mcpMetadata ? 'status-ok' : 'status-warn'}>
+                    当前状态：
+                    {mcpMetadataLoading ? '读取中' : mcpMetadata ? '可接入' : '未读取到服务信息'}
+                  </p>
+                  <p className="hint">
+                    默认支持 `initialize`、`tools/list`、`tools/call`、`resources/list`、`resources/read`。
+                  </p>
+                </div>
+              </section>
+            </>
           ) : null}
 
           {currentTab === 'create' ? (

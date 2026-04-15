@@ -479,6 +479,14 @@ textarea {
   justify-content: flex-start;
 }
 
+.settings-textarea-field {
+  grid-column: 1 / -1;
+}
+
+.settings-textarea-field textarea {
+  min-height: 132px;
+}
+
 .hint {
   color: var(--ink-2);
   font-size: 14px;
@@ -494,6 +502,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .primary-btn,

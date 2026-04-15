@@ -44,42 +44,56 @@ export default defineConfig({
   plugins: [
     react(),
     {
-      name: 'api-ai-settings-dev',
+      name: 'api-dev-routes',
       configureServer(server) {
-        server.middlewares.use('/api/ai-settings', (req, res, next) => {
-          const chunks: Buffer[] = []
-          req.on('data', (chunk) => chunks.push(chunk))
-          req.on('end', async () => {
-            try {
-              const body = Buffer.concat(chunks)
-              const request = nodeReqToWebRequest(req, body)
-              // @ts-expect-error JS module without types
-              const { default: handler } = await import('./api/ai-settings.js')
-              const response = await handler(request)
-              await sendWebResponse(res, response)
-            } catch (err) {
-              next(err as Error)
-            }
+        const routes = [
+          ['/api/ai-settings', './api/ai-settings.js'],
+          ['/api/questions', './api/questions.js'],
+          ['/api/mcp', './api/mcp.js'],
+        ] as const
+
+        for (const [pathname, modulePath] of routes) {
+          server.middlewares.use(pathname, (req, res, next) => {
+            const chunks: Buffer[] = []
+            req.on('data', (chunk) => chunks.push(chunk))
+            req.on('end', async () => {
+              try {
+                const body = Buffer.concat(chunks)
+                const request = nodeReqToWebRequest(req, body)
+                const { default: handler } = await import(modulePath)
+                const response = await handler(request)
+                await sendWebResponse(res, response)
+              } catch (err) {
+                next(err as Error)
+              }
+            })
           })
-        })
+        }
       },
       configurePreviewServer(server) {
-        server.middlewares.use('/api/ai-settings', (req, res, next) => {
-          const chunks: Buffer[] = []
-          req.on('data', (chunk) => chunks.push(chunk))
-          req.on('end', async () => {
-            try {
-              const body = Buffer.concat(chunks)
-              const request = nodeReqToWebRequest(req, body)
-              // @ts-expect-error JS module without types
-              const { default: handler } = await import('./api/ai-settings.js')
-              const response = await handler(request)
-              await sendWebResponse(res, response)
-            } catch (err) {
-              next(err as Error)
-            }
+        const routes = [
+          ['/api/ai-settings', './api/ai-settings.js'],
+          ['/api/questions', './api/questions.js'],
+          ['/api/mcp', './api/mcp.js'],
+        ] as const
+
+        for (const [pathname, modulePath] of routes) {
+          server.middlewares.use(pathname, (req, res, next) => {
+            const chunks: Buffer[] = []
+            req.on('data', (chunk) => chunks.push(chunk))
+            req.on('end', async () => {
+              try {
+                const body = Buffer.concat(chunks)
+                const request = nodeReqToWebRequest(req, body)
+                const { default: handler } = await import(modulePath)
+                const response = await handler(request)
+                await sendWebResponse(res, response)
+              } catch (err) {
+                next(err as Error)
+              }
+            })
           })
-        })
+        }
       },
     },
   ],
