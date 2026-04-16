@@ -27,6 +27,11 @@ import {
   stripTrailingSlash,
   toLocalStorage,
 } from './lib/questionUtils'
+import {
+  hasNoPanguMarker,
+  prepareMarkdownForSubmission,
+  stripNoPanguMarker,
+} from './lib/markdownSpacing'
 import type {
   AiSettings,
   ChoiceMode,
@@ -1656,22 +1661,26 @@ function App() {
 
   const resolveMarkdownForRender = useCallback(
     (value: string): string => {
-      if (!value.includes('![')) {
-        return value
+      const sanitizedValue = stripNoPanguMarker(value)
+      if (!sanitizedValue.includes('![')) {
+        return sanitizedValue
       }
-      if (!value.includes('image_') && !value.includes('data:image/')) {
-        return value
+      if (!sanitizedValue.includes('image_') && !sanitizedValue.includes('data:image/')) {
+        return sanitizedValue
       }
 
-      return value.replace(MARKDOWN_IMAGE_REGEX, (full, alt: string, url: string, title?: string) => {
-        const normalizedUrl = url.trim()
-        const resolvedUrl = resolveImageUrlForRender(normalizedUrl)
-        if (resolvedUrl === normalizedUrl) {
-          return full
-        }
-        const suffix = typeof title === 'string' ? title : ''
-        return `![${alt}](${resolvedUrl}${suffix})`
-      })
+      return sanitizedValue.replace(
+        MARKDOWN_IMAGE_REGEX,
+        (full, alt: string, url: string, title?: string) => {
+          const normalizedUrl = url.trim()
+          const resolvedUrl = resolveImageUrlForRender(normalizedUrl)
+          if (resolvedUrl === normalizedUrl) {
+            return full
+          }
+          const suffix = typeof title === 'string' ? title : ''
+          return `![${alt}](${resolvedUrl}${suffix})`
+        },
+      )
     },
     [resolveImageUrlForRender],
   )
@@ -1685,9 +1694,13 @@ function App() {
     }
   }, [])
 
-  const materializeMarkdownForStorage = (value: string): string => {
-    return materializeImageIds(value, imageMemoryRef.current)
-  }
+  const materializeMarkdownForStorage = useCallback(
+    (value: string, options?: { disableAutoSpacing?: boolean }): string => {
+      const prepared = prepareMarkdownForSubmission(value, options)
+      return materializeImageIds(prepared, imageMemoryRef.current)
+    },
+    [],
+  )
 
   const normalizeMarkdownForEdit = useCallback(
     (value: string): string => {
@@ -2555,6 +2568,7 @@ function App() {
     const createdAt = originalQuestion?.createdAt ?? now
 
     if (draft.type === 'choice') {
+      const disableAutoSpacing = hasNoPanguMarker(stem)
       const normalized = normalizeChoiceStem(stem)
       const options = draft.options.slice(0, draft.optionCount).map((item) => item.trim())
       if (options.some((item) => item.length === 0)) {
@@ -2580,16 +2594,16 @@ function App() {
         id: questionId,
         subject: draft.subject,
         type: 'choice',
-        stem: materializeMarkdownForStorage(stem),
-        normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem),
+        stem: materializeMarkdownForStorage(stem, { disableAutoSpacing }),
+        normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, { disableAutoSpacing }),
         createdAt,
         updatedAt: now,
         choiceMode: draft.choiceMode,
         optionStyle: draft.optionStyle,
         optionCount: draft.optionCount,
-        options: options.map((item) => materializeMarkdownForStorage(item)),
+        options: options.map((item) => materializeMarkdownForStorage(item, { disableAutoSpacing })),
         correctAnswers: answers,
-        analysis: materializeMarkdownForStorage(draft.choiceAnalysis.trim()),
+        analysis: materializeMarkdownForStorage(draft.choiceAnalysis.trim(), { disableAutoSpacing }),
       }
 
       updateQuestions((prev) =>
@@ -2625,6 +2639,7 @@ function App() {
     }
 
     if (draft.type === 'choiceGroup') {
+      const groupDisableAutoSpacing = hasNoPanguMarker(stem)
       const subquestions = draft.choiceGroupQuestions.map((subquestion, index) => {
         const normalized = normalizeChoiceStem(subquestion.stem.trim())
         const options = subquestion.options.slice(0, subquestion.optionCount).map((item) => item.trim())
@@ -2677,21 +2692,38 @@ function App() {
         id: questionId,
         subject: draft.subject,
         type: 'choiceGroup',
-        stem: materializeMarkdownForStorage(stem),
-        normalizedStem: materializeMarkdownForStorage(stem),
+        stem: materializeMarkdownForStorage(stem, {
+          disableAutoSpacing: groupDisableAutoSpacing,
+        }),
+        normalizedStem: materializeMarkdownForStorage(stem, {
+          disableAutoSpacing: groupDisableAutoSpacing,
+        }),
         createdAt,
         updatedAt: now,
-        subquestions: subquestions.map(({ subquestion, normalized, options, answers }) => ({
-          id: subquestion.id,
-          stem: materializeMarkdownForStorage(subquestion.stem.trim()),
-          normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem),
-          choiceMode: subquestion.choiceMode,
-          optionStyle: subquestion.optionStyle,
-          optionCount: subquestion.optionCount,
-          options: options.map((option) => materializeMarkdownForStorage(option)),
-          correctAnswers: answers,
-          analysis: materializeMarkdownForStorage(subquestion.analysis.trim()),
-        })),
+        subquestions: subquestions.map(({ subquestion, normalized, options, answers }) => {
+          const disableAutoSpacing = groupDisableAutoSpacing || hasNoPanguMarker(subquestion.stem)
+          return {
+            id: subquestion.id,
+            stem: materializeMarkdownForStorage(subquestion.stem.trim(), {
+              disableAutoSpacing,
+            }),
+            normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, {
+              disableAutoSpacing,
+            }),
+            choiceMode: subquestion.choiceMode,
+            optionStyle: subquestion.optionStyle,
+            optionCount: subquestion.optionCount,
+            options: options.map((option) =>
+              materializeMarkdownForStorage(option, {
+                disableAutoSpacing,
+              }),
+            ),
+            correctAnswers: answers,
+            analysis: materializeMarkdownForStorage(subquestion.analysis.trim(), {
+              disableAutoSpacing,
+            }),
+          }
+        }),
       }
 
       updateQuestions((prev) =>
@@ -2744,6 +2776,7 @@ function App() {
     }
 
     if (draft.type === 'blank') {
+      const disableAutoSpacing = hasNoPanguMarker(stem)
       const normalized = normalizeBlankStem(stem)
       const answers = ensureLength(draft.fillAnswers, normalized.blankCount)
         .slice(0, normalized.blankCount)
@@ -2753,13 +2786,13 @@ function App() {
         id: questionId,
         subject: draft.subject,
         type: 'blank',
-        stem: materializeMarkdownForStorage(stem),
-        normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem),
+        stem: materializeMarkdownForStorage(stem, { disableAutoSpacing }),
+        normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, { disableAutoSpacing }),
         createdAt,
         updatedAt: now,
         blankCount: normalized.blankCount,
-        answers: answers.map((item) => materializeMarkdownForStorage(item)),
-        analysis: materializeMarkdownForStorage(draft.fillAnalysis.trim()),
+        answers: answers.map((item) => materializeMarkdownForStorage(item, { disableAutoSpacing })),
+        analysis: materializeMarkdownForStorage(draft.fillAnalysis.trim(), { disableAutoSpacing }),
       }
 
       updateQuestions((prev) =>
@@ -2790,6 +2823,7 @@ function App() {
       return
     }
 
+    const disableAutoSpacing = hasNoPanguMarker(stem)
     const normalized = normalizeSubjectiveStem(stem)
     const answerCount = Math.max(1, normalized.blankCount)
     const answers = ensureLength(draft.subjectiveAnswers, answerCount)
@@ -2800,13 +2834,13 @@ function App() {
       id: questionId,
       subject: draft.subject,
       type: 'subjective',
-      stem: materializeMarkdownForStorage(stem),
-      normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem),
+      stem: materializeMarkdownForStorage(stem, { disableAutoSpacing }),
+      normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, { disableAutoSpacing }),
       createdAt,
       updatedAt: now,
       areaCount: normalized.blankCount,
-      answers: answers.map((item) => materializeMarkdownForStorage(item)),
-      analysis: materializeMarkdownForStorage(draft.subjectiveAnalysis.trim()),
+      answers: answers.map((item) => materializeMarkdownForStorage(item, { disableAutoSpacing })),
+      analysis: materializeMarkdownForStorage(draft.subjectiveAnalysis.trim(), { disableAutoSpacing }),
     }
 
     updateQuestions((prev) =>

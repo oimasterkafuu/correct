@@ -1,4 +1,5 @@
 import { alphaLabel, countAreaTokens, countInlineTokens, migrateStemTokens } from './questionUtils'
+import { stripNoPanguMarker } from './markdownSpacing'
 import {
   DEFAULT_PDF_EXPORT_SPACING_CONFIG,
   type PdfExportSpacingConfig,
@@ -62,6 +63,8 @@ const CIRCLE_LABELS = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '
 const NO_LINE_START_CHARS =
   '，。！？；：、,.!?;:)]｝〕〉》」』】】”’％%…'
 const NO_LINE_END_CHARS = '([｛〔〈《「『【“‘'
+const ASCII_WORD_CHAR_REGEX = /[A-Za-z0-9]/
+const ASCII_WORD_CONNECTOR_REGEX = /[._'’/-]/
 
 type RenderNode =
   | {
@@ -289,11 +292,20 @@ function mmToPx(mm: number): number {
   return mm * PX_PER_MM
 }
 
+function pxToMm(px: number): number {
+  return px / PX_PER_MM
+}
+
 function buildOptionMarker(index: number, style: 'latin' | 'circle'): string {
   if (style === 'circle') {
     return CIRCLE_LABELS[index] ?? `(${index + 1})`
   }
   return alphaLabel(index)
+}
+
+function buildOptionLabel(index: number, style: 'latin' | 'circle'): string {
+  const marker = buildOptionMarker(index, style)
+  return style === 'circle' ? `${marker} ` : `${marker}. `
 }
 
 function buildQuestionMarker(question: Question): string {
@@ -382,7 +394,7 @@ function collectMathExpressions(
 }
 
 function normalizeMarkdownText(markdown: string): string {
-  return normalizeMathDelimiters(markdown)
+  return normalizeMathDelimiters(stripNoPanguMarker(markdown))
     .replace(/```([\s\S]*?)```/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
@@ -847,13 +859,14 @@ function resolveImageUrl(src: string): string {
 }
 
 function splitMarkdownTextAndImages(markdown: string): MarkdownSplitResult {
+  const normalizedMarkdown = stripNoPanguMarker(markdown)
   const images: MarkdownSplitResult['images'] = []
   const textChunks: string[] = []
   let cursor = 0
 
-  for (const match of markdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
+  for (const match of normalizedMarkdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
     const index = match.index ?? 0
-    const before = markdown.slice(cursor, index).trim()
+    const before = normalizedMarkdown.slice(cursor, index).trim()
     if (before.length > 0) {
       textChunks.push(before)
     }
@@ -864,7 +877,7 @@ function splitMarkdownTextAndImages(markdown: string): MarkdownSplitResult {
     cursor = index + match[0].length
   }
 
-  const tail = markdown.slice(cursor).trim()
+  const tail = normalizedMarkdown.slice(cursor).trim()
   if (tail.length > 0) {
     textChunks.push(tail)
   }
@@ -953,6 +966,7 @@ function prependQuestionMarkerToNodes(marker: string, nodes: RenderNode[]): Rend
 }
 
 function markdownToNodes(markdown: string, textStyle?: TextNodeStyle): RenderNode[] {
+  const normalizedMarkdown = stripNoPanguMarker(markdown)
   const resolvedStyle: Required<TextNodeStyle> = {
     fontSize: textStyle?.fontSize ?? BASE_FONT_SIZE,
     bold: textStyle?.bold ?? false,
@@ -962,9 +976,9 @@ function markdownToNodes(markdown: string, textStyle?: TextNodeStyle): RenderNod
   const nodes: RenderNode[] = []
   let cursor = 0
 
-  for (const match of markdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
+  for (const match of normalizedMarkdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
     const index = match.index ?? 0
-    nodes.push(...parseMarkdownTextToNodes(markdown.slice(cursor, index), resolvedStyle))
+    nodes.push(...parseMarkdownTextToNodes(normalizedMarkdown.slice(cursor, index), resolvedStyle))
 
     nodes.push({
       type: 'image',
@@ -974,7 +988,7 @@ function markdownToNodes(markdown: string, textStyle?: TextNodeStyle): RenderNod
     cursor = index + match[0].length
   }
 
-  nodes.push(...parseMarkdownTextToNodes(markdown.slice(cursor), resolvedStyle))
+  nodes.push(...parseMarkdownTextToNodes(normalizedMarkdown.slice(cursor), resolvedStyle))
 
   return nodes
 }
@@ -1042,7 +1056,7 @@ function prependLabelToNodes(label: string, nodes: RenderNode[], textStyle?: Tex
 }
 
 function buildAnalysisNodes(analysisMarkdown: string): RenderNode[] {
-  return markdownToNodes(analysisMarkdown, {
+  return markdownToNodes(stripNoPanguMarker(analysisMarkdown), {
     fontSize: ANALYSIS_FONT_SIZE,
     fontFamily: ANALYSIS_FONT_FAMILY,
     color: '#2f3a4c',
@@ -1053,7 +1067,8 @@ function collectImageSources(questions: Question[], includeAnalysis: boolean): s
   const result = new Set<string>()
 
   const consume = (markdown: string) => {
-    for (const match of markdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
+    const normalizedMarkdown = stripNoPanguMarker(markdown)
+    for (const match of normalizedMarkdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
       result.add(resolveImageUrl(match[2]))
     }
   }
@@ -1117,7 +1132,7 @@ function collectMathSources(
   const expressions = new Map<string, { latex: string; displayMode: boolean }>()
 
   const consume = (markdown: string) => {
-    collectMathExpressions(markdown, expressions)
+    collectMathExpressions(stripNoPanguMarker(markdown), expressions)
   }
 
   for (const question of questions) {
@@ -1263,7 +1278,10 @@ function wrapTextWithFirstLineWidth(
     }
 
     let current = ''
-    for (const char of trimmed) {
+    let cursor = 0
+    while (cursor < trimmed.length) {
+      const char = consumeTextLayoutUnit(trimmed, cursor)
+      cursor += char.length
       const maxWidth = firstDisplayLine ? firstLineMaxWidth : otherLineMaxWidth
       const candidate = `${current}${char}`
       const width = ctx.measureText(candidate).width
@@ -1296,6 +1314,45 @@ function wrapTextWithFirstLineWidth(
   }
 
   return lines.length > 0 ? lines : ['']
+}
+
+function isAsciiWordChar(char: string): boolean {
+  return ASCII_WORD_CHAR_REGEX.test(char)
+}
+
+function isAsciiWordConnector(char: string): boolean {
+  return ASCII_WORD_CONNECTOR_REGEX.test(char)
+}
+
+function consumeTextLayoutUnit(text: string, startIndex: number): string {
+  const firstChar = text[startIndex] ?? ''
+  if (!firstChar) {
+    return ''
+  }
+
+  if (!isAsciiWordChar(firstChar)) {
+    return firstChar
+  }
+
+  let endIndex = startIndex + 1
+  while (endIndex < text.length) {
+    const nextChar = text[endIndex] ?? ''
+    if (isAsciiWordChar(nextChar)) {
+      endIndex += 1
+      continue
+    }
+
+    const prevChar = text[endIndex - 1] ?? ''
+    const nextNextChar = text[endIndex + 1] ?? ''
+    if (isAsciiWordConnector(nextChar) && isAsciiWordChar(prevChar) && isAsciiWordChar(nextNextChar)) {
+      endIndex += 1
+      continue
+    }
+
+    break
+  }
+
+  return text.slice(startIndex, endIndex)
 }
 
 function getMathTokenSize(
@@ -1466,7 +1523,10 @@ function tokenizeRichTextSegments(args: {
     const parts = segment.text.split('\n')
     parts.forEach((part, index) => {
       if (part.length > 0) {
-        for (const char of part) {
+        let cursor = 0
+        while (cursor < part.length) {
+          const char = consumeTextLayoutUnit(part, cursor)
+          cursor += char.length
           tokens.push({
             type: 'text',
             text: char,
@@ -2663,10 +2723,10 @@ function appendChoiceContentNodes(args: {
 
   const visibleOptions = options.slice(0, optionCount)
   visibleOptions.forEach((option, index) => {
-    const marker = buildOptionMarker(index, optionStyle)
+    const markerLabel = buildOptionLabel(index, optionStyle)
     const isCorrect = correctAnswers.includes(index)
     const optionColor = isCorrect ? CORRECT_OPTION_COLOR : '#1e2430'
-    const optionNodes = prependLabelToNodes(`${marker}. `, markdownToNodes(option, { color: optionColor }), {
+    const optionNodes = prependLabelToNodes(markerLabel, markdownToNodes(option, { color: optionColor }), {
       color: optionColor,
     })
     nodes.push(...optionNodes)
@@ -3001,6 +3061,15 @@ function resolveBindingSide(
   return firstPageBindingSide === 'left' ? 'right' : 'left'
 }
 
+function canFlowAcrossPage(
+  pageNumber: number,
+  firstPageBindingSide: PdfExportSpacingConfig['firstPageBindingSide'],
+): boolean {
+  const currentBindingSide = resolveBindingSide(pageNumber, firstPageBindingSide)
+  const nextBindingSide = resolveBindingSide(pageNumber + 1, firstPageBindingSide)
+  return currentBindingSide === 'right' && nextBindingSide === 'left'
+}
+
 function drawLooseLeafHoleGuides(
   ctx: CanvasRenderingContext2D,
   bindingSide: 'left' | 'right',
@@ -3213,48 +3282,9 @@ export async function exportQuestionsAsPdf(
 
   const sortedPlans = [...plans].sort((left, right) => right.totalHeightPx - left.totalHeightPx)
 
-  const pages: PageState[] = [
-    (() => {
-      const layout = resolvePageLayout({
-        pageNumber: 1,
-        pageWidthPx,
-        columnWidthPx,
-        gapPx,
-        dividerWidthPx,
-        baseMarginPx,
-        bindingMarginPx,
-        firstPageBindingSide: spacingConfig.firstPageBindingSide,
-      })
-      return createPageState({
-        pageWidthPx,
-        pageHeightPx,
-        contentTopPx,
-        contentBottomPx,
-        leftX: layout.leftX,
-        rightX: layout.rightX,
-        dividerX: layout.dividerX,
-        bindingSide: layout.bindingSide,
-        renderLooseLeafHoles: spacingConfig.renderLooseLeafHoles,
-      })
-    })(),
-  ]
-
-  let pageIndex = 0
-  let columnIndex: 0 | 1 = 0
-
-  const currentPage = () => pages[pageIndex]
-  const currentY = () => currentPage().columnY[columnIndex]
-  const remainingInCurrentColumn = () => contentBottomPx - currentY()
-
-  const moveToNextColumnOrPage = () => {
-    if (columnIndex === 0) {
-      columnIndex = 1
-      return
-    }
-
-    pageIndex += 1
+  const createExportPage = (pageNumber: number): PageState => {
     const layout = resolvePageLayout({
-      pageNumber: pageIndex + 1,
+      pageNumber,
       pageWidthPx,
       columnWidthPx,
       gapPx,
@@ -3263,19 +3293,99 @@ export async function exportQuestionsAsPdf(
       bindingMarginPx,
       firstPageBindingSide: spacingConfig.firstPageBindingSide,
     })
-    pages.push(
-      createPageState({
-        pageWidthPx,
-        pageHeightPx,
-        contentTopPx,
-        contentBottomPx,
-        leftX: layout.leftX,
-        rightX: layout.rightX,
-        dividerX: layout.dividerX,
-        bindingSide: layout.bindingSide,
-        renderLooseLeafHoles: spacingConfig.renderLooseLeafHoles,
-      }),
-    )
+
+    return createPageState({
+      pageWidthPx,
+      pageHeightPx,
+      contentTopPx,
+      contentBottomPx,
+      leftX: layout.leftX,
+      rightX: layout.rightX,
+      dividerX: layout.dividerX,
+      bindingSide: layout.bindingSide,
+      renderLooseLeafHoles: spacingConfig.renderLooseLeafHoles,
+    })
+  }
+
+  const pages: PageState[] = [createExportPage(1)]
+
+  let pageIndex = 0
+  let columnIndex: 0 | 1 = 0
+
+  const getPage = (targetPageIndex: number): PageState => {
+    while (pages.length <= targetPageIndex) {
+      pages.push(createExportPage(pages.length + 1))
+    }
+    return pages[targetPageIndex]
+  }
+
+  const currentPage = () => getPage(pageIndex)
+  const currentY = () => currentPage().columnY[columnIndex]
+  const remainingInCurrentColumn = () => contentBottomPx - currentY()
+
+  const resolveSurfaceStartPageIndex = (fromPageIndex: number): number => {
+    if (fromPageIndex > 0 && canFlowAcrossPage(fromPageIndex, spacingConfig.firstPageBindingSide)) {
+      return fromPageIndex - 1
+    }
+    return fromPageIndex
+  }
+
+  const resolveSurfaceEndPageIndex = (fromPageIndex: number): number => {
+    const surfaceStartPageIndex = resolveSurfaceStartPageIndex(fromPageIndex)
+    const surfaceStartPageNumber = surfaceStartPageIndex + 1
+    return canFlowAcrossPage(surfaceStartPageNumber, spacingConfig.firstPageBindingSide)
+      ? surfaceStartPageIndex + 1
+      : surfaceStartPageIndex
+  }
+
+  const remainingInCurrentSurface = () => {
+    const surfaceEndPageIndex = resolveSurfaceEndPageIndex(pageIndex)
+    let remaining = 0
+
+    for (let targetPageIndex = pageIndex; targetPageIndex <= surfaceEndPageIndex; targetPageIndex += 1) {
+      const page = getPage(targetPageIndex)
+      const startColumnIndex = targetPageIndex === pageIndex ? columnIndex : 0
+
+      for (let targetColumnIndex = startColumnIndex; targetColumnIndex <= 1; targetColumnIndex += 1) {
+        remaining += contentBottomPx - page.columnY[targetColumnIndex as 0 | 1]
+      }
+    }
+
+    return remaining
+  }
+
+  const isCurrentSurfacePristine = () => {
+    const surfaceStartPageIndex = resolveSurfaceStartPageIndex(pageIndex)
+    const surfaceEndPageIndex = resolveSurfaceEndPageIndex(pageIndex)
+
+    if (pageIndex !== surfaceStartPageIndex || columnIndex !== 0) {
+      return false
+    }
+
+    for (let targetPageIndex = surfaceStartPageIndex; targetPageIndex <= surfaceEndPageIndex; targetPageIndex += 1) {
+      const page = getPage(targetPageIndex)
+      if (page.columnY[0] !== contentTopPx || page.columnY[1] !== contentTopPx) {
+        return false
+      }
+    }
+
+    return true
+  }
+
+  const moveToNextFlowPosition = () => {
+    if (columnIndex === 0) {
+      columnIndex = 1
+      return
+    }
+
+    pageIndex += 1
+    getPage(pageIndex)
+    columnIndex = 0
+  }
+
+  const moveToNextSurface = () => {
+    pageIndex = resolveSurfaceEndPageIndex(pageIndex) + 1
+    getPage(pageIndex)
     columnIndex = 0
   }
 
@@ -3414,6 +3524,39 @@ export async function exportQuestionsAsPdf(
       return splitTableNodeByHeight(node, measureCtx, columnWidthPx, maxHeight, mathAssetMap)
     }
 
+    if (node.type === 'space') {
+      const totalHeightPx = mmToPx(node.heightMm)
+      if (totalHeightPx <= maxHeight || totalHeightPx <= 0) {
+        return null
+      }
+
+      const minCarryHeightPx = totalHeightPx * 0.6
+      const headHeightPx = Math.max(0, maxHeight)
+      if (headHeightPx <= 0) {
+        return null
+      }
+
+      const tailHeightPx =
+        headHeightPx >= minCarryHeightPx
+          ? totalHeightPx - headHeightPx
+          : Math.max(totalHeightPx - headHeightPx, minCarryHeightPx)
+
+      if (tailHeightPx <= 0) {
+        return null
+      }
+
+      return {
+        head: {
+          type: 'space',
+          heightMm: pxToMm(headHeightPx),
+        },
+        tail: {
+          type: 'space',
+          heightMm: pxToMm(tailHeightPx),
+        },
+      }
+    }
+
     return null
   }
 
@@ -3441,22 +3584,36 @@ export async function exportQuestionsAsPdf(
           nodes: drawNodes,
           heightPx: Math.ceil(chosenHeight),
         })
+        if (queue.length > 0 && remainingInCurrentColumn() <= 0) {
+          moveToNextFlowPosition()
+        }
         continue
       }
 
       const firstNode = queue[0]
       const firstHeight = measureNodesHeight([firstNode])
+      let split = splitNodeForHeight(firstNode, remainingInCurrentColumn())
 
-      if (firstHeight <= contentHeightPx) {
-        moveToNextColumnOrPage()
+      if (split) {
+        drawBlockOnCurrentColumn({
+          nodes: [split.head],
+          heightPx: Math.ceil(measureNodesHeight([split.head])),
+        })
+        queue[0] = split.tail
+
+        if (remainingInCurrentColumn() <= 0) {
+          moveToNextFlowPosition()
+        }
         continue
       }
 
-      let split = splitNodeForHeight(firstNode, remainingInCurrentColumn())
-      if (!split) {
-        moveToNextColumnOrPage()
-        split = splitNodeForHeight(firstNode, contentHeightPx)
+      if (firstHeight <= contentHeightPx) {
+        moveToNextFlowPosition()
+        continue
       }
+
+      moveToNextFlowPosition()
+      split = splitNodeForHeight(firstNode, contentHeightPx)
 
       if (!split) {
         // 兜底：无法继续拆分时强制绘制并移除，避免死循环。
@@ -3466,7 +3623,7 @@ export async function exportQuestionsAsPdf(
           heightPx: Math.min(firstHeight, remainingInCurrentColumn()),
         })
         if (queue.length > 0) {
-          moveToNextColumnOrPage()
+          moveToNextFlowPosition()
         }
         continue
       }
@@ -3478,26 +3635,17 @@ export async function exportQuestionsAsPdf(
       queue[0] = split.tail
 
       if (remainingInCurrentColumn() <= 0) {
-        moveToNextColumnOrPage()
+        moveToNextFlowPosition()
       }
     }
   }
 
-  const drawSimplePlan = (plan: RenderPlan) => {
-    const block = plan.blocks[0]
-    if (!block) return
-
-    if (block.heightPx <= remainingInCurrentColumn()) {
-      drawBlockOnCurrentColumn(block)
-      return
+  const drawFlowableBlock = (block: RenderBlock) => {
+    if (block.heightPx > remainingInCurrentSurface() && !isCurrentSurfacePristine()) {
+      moveToNextSurface()
     }
 
-    if (block.heightPx <= contentHeightPx) {
-      let safety = 0
-      while (block.heightPx > remainingInCurrentColumn() && safety < 10) {
-        moveToNextColumnOrPage()
-        safety += 1
-      }
+    if (block.heightPx <= remainingInCurrentColumn()) {
       drawBlockOnCurrentColumn(block)
       return
     }
@@ -3505,109 +3653,22 @@ export async function exportQuestionsAsPdf(
     drawOversizedBlock(block)
   }
 
-  const placeWholeBlock = (block: RenderBlock): boolean => {
-    if (block.heightPx <= remainingInCurrentColumn()) {
-      drawBlockOnCurrentColumn(block)
-      return true
-    }
-
-    if (block.heightPx <= contentHeightPx) {
-      let safety = 0
-      while (block.heightPx > remainingInCurrentColumn() && safety < 10) {
-        moveToNextColumnOrPage()
-        safety += 1
-      }
-      if (block.heightPx <= remainingInCurrentColumn()) {
-        drawBlockOnCurrentColumn(block)
-        return true
-      }
-    }
-
-    return false
-  }
-
-  const drawChoiceLikePlan = (plan: RenderPlan) => {
+  const drawPlan = (plan: RenderPlan) => {
     if (plan.blocks.length === 0) {
       return
     }
 
-    const [coreBlock, ...analysisBlocks] = plan.blocks
-    if (coreBlock) {
-      const placed = placeWholeBlock(coreBlock)
-      if (!placed) {
-        // 题面+选项理论上不分页；仅在单栏放不下时兜底拆分，避免内容丢失。
-        drawOversizedBlock(coreBlock)
-      }
-    }
-
-    for (const block of analysisBlocks) {
-      const placed = placeWholeBlock(block)
-      if (!placed) {
-        drawOversizedBlock(block)
-      }
-    }
-  }
-
-  const drawSubjectivePlan = (plan: RenderPlan) => {
-    const remainingCurrent = remainingInCurrentColumn()
-    const rightRemaining =
-      columnIndex === 0 ? contentBottomPx - currentPage().columnY[1] : 0
-    const capacityWithoutPageBreak = remainingCurrent + rightRemaining
-
-    if (plan.totalHeightPx > capacityWithoutPageBreak && plan.totalHeightPx <= contentHeightPx * 2) {
-      if (!(columnIndex === 0 && currentPage().columnY[0] === contentTopPx && currentPage().columnY[1] === contentTopPx)) {
-        pageIndex += 1
-        const layout = resolvePageLayout({
-          pageNumber: pageIndex + 1,
-          pageWidthPx,
-          columnWidthPx,
-          gapPx,
-          dividerWidthPx,
-          baseMarginPx,
-          bindingMarginPx,
-          firstPageBindingSide: spacingConfig.firstPageBindingSide,
-        })
-        pages.push(
-          createPageState({
-            pageWidthPx,
-            pageHeightPx,
-            contentTopPx,
-            contentBottomPx,
-            leftX: layout.leftX,
-            rightX: layout.rightX,
-            dividerX: layout.dividerX,
-            bindingSide: layout.bindingSide,
-            renderLooseLeafHoles: spacingConfig.renderLooseLeafHoles,
-          }),
-        )
-        columnIndex = 0
-      }
+    if (plan.totalHeightPx > remainingInCurrentSurface() && !isCurrentSurfacePristine()) {
+      moveToNextSurface()
     }
 
     for (const block of plan.blocks) {
-      if (block.heightPx <= remainingInCurrentColumn()) {
-        drawBlockOnCurrentColumn(block)
-        continue
-      }
-      if (block.heightPx <= contentHeightPx) {
-        moveToNextColumnOrPage()
-        if (block.heightPx <= remainingInCurrentColumn()) {
-          drawBlockOnCurrentColumn(block)
-          continue
-        }
-      }
-      drawOversizedBlock(block)
+      drawFlowableBlock(block)
     }
   }
 
   for (const plan of sortedPlans) {
-    if (plan.type === 'subjective') {
-      drawSubjectivePlan(plan)
-    } else if (plan.type === 'choice' || plan.type === 'choiceGroup' || plan.type === 'blank') {
-      drawChoiceLikePlan(plan)
-    } else {
-      drawSimplePlan(plan)
-    }
+    drawPlan(plan)
   }
 
   const { jsPDF } = await import('jspdf')
@@ -3622,8 +3683,7 @@ export async function exportQuestionsAsPdf(
     if (index > 0) {
       pdf.addPage([PAGE_WIDTH_MM, PAGE_HEIGHT_MM], 'portrait')
     }
-    const dataUrl = page.canvas.toDataURL('image/png')
-    pdf.addImage(dataUrl, 'PNG', 0, 0, PAGE_WIDTH_MM, PAGE_HEIGHT_MM)
+    pdf.addImage(page.canvas, 'PNG', 0, 0, PAGE_WIDTH_MM, PAGE_HEIGHT_MM, undefined, 'FAST')
   })
 
   const now = new Date()
