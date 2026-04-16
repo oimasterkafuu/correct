@@ -2769,6 +2769,7 @@ function buildChoicePlan(
     optionStyle: question.optionStyle,
     spacingConfig,
     questionMarker: marker,
+    includeTrailingSpace: !includeAnalysis,
   })
 
   const coreBlock = makeBlock(measureCtx, nodes, columnWidthPx, imageMap, mathAssetMap)
@@ -2830,10 +2831,12 @@ function buildBlankPlan(
     })
   }
 
-  nodes.push({
-    type: 'space',
-    heightMm: extraSpaceMm,
-  })
+  if (!includeAnalysis) {
+    nodes.push({
+      type: 'space',
+      heightMm: extraSpaceMm,
+    })
+  }
 
   const coreBlock = makeBlock(measureCtx, nodes, columnWidthPx, imageMap, mathAssetMap)
   const analysisBlocks =
@@ -2947,7 +2950,7 @@ function buildChoiceGroupPlan(
         type: 'space',
         heightMm: spacingConfig.choiceGroupQuestionGapMm,
       })
-    } else {
+    } else if (!includeAnalysis) {
       nodes.push({
         type: 'space',
         heightMm: spacingConfig.choiceAfterOptionsGapMm,
@@ -2988,9 +2991,11 @@ function buildSubjectivePlan(
   const areaCount = Math.max(1, Math.max(question.areaCount, countAreaTokens(baseStem)))
   const splitted = splitSubjectiveStem(baseStem, areaCount)
   const unitSpaceMm =
-    question.subject === 'math'
-      ? spacingConfig.subjectiveMathAnswerSpaceMm
-      : spacingConfig.subjectiveAnswerSpaceMm
+    includeAnalysis
+      ? 0
+      : question.subject === 'math'
+        ? spacingConfig.subjectiveMathAnswerSpaceMm
+        : spacingConfig.subjectiveAnswerSpaceMm
   const marker = buildQuestionMarker(question)
 
   const blocks: RenderBlock[] = []
@@ -3026,7 +3031,7 @@ function buildSubjectivePlan(
   const trailingAnswerSpaceNodes: RenderNode[] = [
     {
       type: 'space',
-      heightMm: spacingConfig.subjectiveAfterAnswerSpaceMm,
+      heightMm: includeAnalysis ? 0 : spacingConfig.subjectiveAfterAnswerSpaceMm,
     },
   ]
   blocks.push(makeBlock(measureCtx, trailingAnswerSpaceNodes, columnWidthPx, imageMap, mathAssetMap))
@@ -3059,15 +3064,6 @@ function resolveBindingSide(
     return firstPageBindingSide
   }
   return firstPageBindingSide === 'left' ? 'right' : 'left'
-}
-
-function canFlowAcrossPage(
-  pageNumber: number,
-  firstPageBindingSide: PdfExportSpacingConfig['firstPageBindingSide'],
-): boolean {
-  const currentBindingSide = resolveBindingSide(pageNumber, firstPageBindingSide)
-  const nextBindingSide = resolveBindingSide(pageNumber + 1, firstPageBindingSide)
-  return currentBindingSide === 'right' && nextBindingSide === 'left'
 }
 
 function drawLooseLeafHoleGuides(
@@ -3323,55 +3319,6 @@ export async function exportQuestionsAsPdf(
   const currentY = () => currentPage().columnY[columnIndex]
   const remainingInCurrentColumn = () => contentBottomPx - currentY()
 
-  const resolveSurfaceStartPageIndex = (fromPageIndex: number): number => {
-    if (fromPageIndex > 0 && canFlowAcrossPage(fromPageIndex, spacingConfig.firstPageBindingSide)) {
-      return fromPageIndex - 1
-    }
-    return fromPageIndex
-  }
-
-  const resolveSurfaceEndPageIndex = (fromPageIndex: number): number => {
-    const surfaceStartPageIndex = resolveSurfaceStartPageIndex(fromPageIndex)
-    const surfaceStartPageNumber = surfaceStartPageIndex + 1
-    return canFlowAcrossPage(surfaceStartPageNumber, spacingConfig.firstPageBindingSide)
-      ? surfaceStartPageIndex + 1
-      : surfaceStartPageIndex
-  }
-
-  const remainingInCurrentSurface = () => {
-    const surfaceEndPageIndex = resolveSurfaceEndPageIndex(pageIndex)
-    let remaining = 0
-
-    for (let targetPageIndex = pageIndex; targetPageIndex <= surfaceEndPageIndex; targetPageIndex += 1) {
-      const page = getPage(targetPageIndex)
-      const startColumnIndex = targetPageIndex === pageIndex ? columnIndex : 0
-
-      for (let targetColumnIndex = startColumnIndex; targetColumnIndex <= 1; targetColumnIndex += 1) {
-        remaining += contentBottomPx - page.columnY[targetColumnIndex as 0 | 1]
-      }
-    }
-
-    return remaining
-  }
-
-  const isCurrentSurfacePristine = () => {
-    const surfaceStartPageIndex = resolveSurfaceStartPageIndex(pageIndex)
-    const surfaceEndPageIndex = resolveSurfaceEndPageIndex(pageIndex)
-
-    if (pageIndex !== surfaceStartPageIndex || columnIndex !== 0) {
-      return false
-    }
-
-    for (let targetPageIndex = surfaceStartPageIndex; targetPageIndex <= surfaceEndPageIndex; targetPageIndex += 1) {
-      const page = getPage(targetPageIndex)
-      if (page.columnY[0] !== contentTopPx || page.columnY[1] !== contentTopPx) {
-        return false
-      }
-    }
-
-    return true
-  }
-
   const moveToNextFlowPosition = () => {
     if (columnIndex === 0) {
       columnIndex = 1
@@ -3379,12 +3326,6 @@ export async function exportQuestionsAsPdf(
     }
 
     pageIndex += 1
-    getPage(pageIndex)
-    columnIndex = 0
-  }
-
-  const moveToNextSurface = () => {
-    pageIndex = resolveSurfaceEndPageIndex(pageIndex) + 1
     getPage(pageIndex)
     columnIndex = 0
   }
@@ -3641,10 +3582,6 @@ export async function exportQuestionsAsPdf(
   }
 
   const drawFlowableBlock = (block: RenderBlock) => {
-    if (block.heightPx > remainingInCurrentSurface() && !isCurrentSurfacePristine()) {
-      moveToNextSurface()
-    }
-
     if (block.heightPx <= remainingInCurrentColumn()) {
       drawBlockOnCurrentColumn(block)
       return
@@ -3656,10 +3593,6 @@ export async function exportQuestionsAsPdf(
   const drawPlan = (plan: RenderPlan) => {
     if (plan.blocks.length === 0) {
       return
-    }
-
-    if (plan.totalHeightPx > remainingInCurrentSurface() && !isCurrentSurfacePristine()) {
-      moveToNextSurface()
     }
 
     for (const block of plan.blocks) {
