@@ -2991,11 +2991,9 @@ function buildSubjectivePlan(
   const areaCount = Math.max(1, Math.max(question.areaCount, countAreaTokens(baseStem)))
   const splitted = splitSubjectiveStem(baseStem, areaCount)
   const unitSpaceMm =
-    includeAnalysis
-      ? 0
-      : question.subject === 'math'
-        ? spacingConfig.subjectiveMathAnswerSpaceMm
-        : spacingConfig.subjectiveAnswerSpaceMm
+    question.subject === 'math'
+      ? spacingConfig.subjectiveMathAnswerSpaceMm
+      : spacingConfig.subjectiveAnswerSpaceMm
   const marker = buildQuestionMarker(question)
 
   const blocks: RenderBlock[] = []
@@ -3318,6 +3316,22 @@ export async function exportQuestionsAsPdf(
   const currentPage = () => getPage(pageIndex)
   const currentY = () => currentPage().columnY[columnIndex]
   const remainingInCurrentColumn = () => contentBottomPx - currentY()
+  const visibleContinuousCapacityFromCurrent = (): number => {
+    const remaining = Math.max(0, remainingInCurrentColumn())
+    const page = currentPage()
+    let capacity = remaining
+
+    if (columnIndex === 0) {
+      capacity += contentHeightPx
+    }
+
+    const nextPage = getPage(pageIndex + 1)
+    if (page.bindingSide === 'right' && nextPage.bindingSide === 'left') {
+      capacity += contentHeightPx * 2
+    }
+
+    return capacity
+  }
 
   const moveToNextFlowPosition = () => {
     if (columnIndex === 0) {
@@ -3377,6 +3391,9 @@ export async function exportQuestionsAsPdf(
         color: node.color,
         mathAssetMap,
       })
+      if (measureRichTextLinesHeight(lines) > visibleContinuousCapacityFromCurrent()) {
+        return null
+      }
       const split = splitRichTextLinesByHeight(lines, maxHeight)
       if (!split) {
         return null
@@ -3412,6 +3429,9 @@ export async function exportQuestionsAsPdf(
         color: node.color,
         mathAssetMap,
       })
+      if (measureRichTextLinesHeight(lines) > visibleContinuousCapacityFromCurrent()) {
+        return null
+      }
       const split = splitRichTextLinesByHeight(lines, maxHeight)
       if (!split) {
         return null
@@ -3437,6 +3457,9 @@ export async function exportQuestionsAsPdf(
     }
 
     if (node.type === 'richTextLines') {
+      if (measureRichTextLinesHeight(node.lines) > visibleContinuousCapacityFromCurrent()) {
+        return null
+      }
       const split = splitRichTextLinesByHeight(node.lines, maxHeight)
       if (!split) {
         return null
@@ -3462,6 +3485,15 @@ export async function exportQuestionsAsPdf(
     }
 
     if (node.type === 'table') {
+      const layout = resolveTableNodeLayout({
+        ctx: measureCtx,
+        node,
+        widthPx: columnWidthPx,
+        mathAssetMap,
+      })
+      if (layout.totalHeight > visibleContinuousCapacityFromCurrent()) {
+        return null
+      }
       return splitTableNodeByHeight(node, measureCtx, columnWidthPx, maxHeight, mathAssetMap)
     }
 
