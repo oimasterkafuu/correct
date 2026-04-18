@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import katex from 'katex'
 import { useLocation, useNavigate } from 'react-router-dom'
 import ExportConfigModal from './components/ExportConfigModal'
@@ -99,6 +99,11 @@ interface QuickImportQuestionPayload {
   correctAnswers: string[]
   answers: string[]
   subquestions: QuickImportChoiceSubquestionPayload[]
+}
+
+interface ParsedImageImportResponse {
+  stemMarkdown: string
+  options: string[]
 }
 
 type ChatContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
@@ -255,6 +260,15 @@ function generateUuid(): string {
     const r = (Math.random() * 16) | 0
     const v = c === 'x' ? r : (r & 0x3) | 0x8
     return v.toString(16)
+  })
+}
+
+async function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(new Error('图片读取失败'))
+    reader.readAsDataURL(file)
   })
 }
 
@@ -1379,6 +1393,46 @@ function parseQuickImportAiResponse(raw: string): QuickImportQuestionPayload[] |
     .filter((item): item is QuickImportQuestionPayload => item !== null)
 }
 
+function parseImageImportAiResponse(raw: string): ParsedImageImportResponse | null {
+  const candidate = extractJsonCandidate(raw)
+  if (!candidate) {
+    const fallback = raw.trim()
+    return fallback
+      ? {
+          stemMarkdown: fallback,
+          options: [],
+        }
+      : null
+  }
+
+  const json = parseJsonCandidate(candidate)
+  if (!json) {
+    const fallback = raw.trim()
+    return fallback
+      ? {
+          stemMarkdown: fallback,
+          options: [],
+        }
+      : null
+  }
+
+  const stemMarkdown = String(
+    json.stem_markdown ?? json.stem ?? json.question_markdown ?? json.text ?? json['题面'] ?? '',
+  ).trim()
+  const options = normalizeToStringArray(json.options ?? json.option_markdown ?? json['选项']).map(
+    stripLeadingOptionMarker,
+  )
+
+  if (!stemMarkdown && options.length === 0) {
+    return null
+  }
+
+  return {
+    stemMarkdown,
+    options,
+  }
+}
+
 function buildChoiceDisplayMarkdown(question: Extract<Question, { type: 'choice' }>): string {
   const stemBase = migrateStemTokens(question.normalizedStem)
   const stemWithToken =
@@ -1838,6 +1892,7 @@ function App() {
   const [quickImportHtml, setQuickImportHtml] = useState('')
   const [quickImportMarkdown, setQuickImportMarkdown] = useState('')
   const [quickImportSubmitting, setQuickImportSubmitting] = useState(false)
+  const [singleImageImporting, setSingleImageImporting] = useState(false)
   const [notice, setNotice] = useState('')
   const [aiLoadingTarget, setAiLoadingTarget] = useState<AnalysisTarget | null>(null)
   const [pdfExporting, setPdfExporting] = useState(false)
@@ -1860,6 +1915,8 @@ function App() {
   const imageIdByDataUrlRef = useRef<Record<string, string>>({})
   const blobUrlByDataUrlRef = useRef<Record<string, string>>({})
   const imageIndexRef = useRef(1)
+  const singleImageImportInputRef = useRef<HTMLInputElement>(null)
+  const draftTypeRef = useRef<QuestionType>(draft.type)
   const questionCloudSnapshotRef = useRef<string | null>(
     serializeQuestionSnapshot(INITIAL_LOCAL_QUESTION_SNAPSHOT),
   )
@@ -2513,6 +2570,10 @@ function App() {
   }, [editPathQuestionId])
 
   useEffect(() => {
+    draftTypeRef.current = draft.type
+  }, [draft.type])
+
+  useEffect(() => {
     if (!notice) {
       return undefined
     }
@@ -2786,6 +2847,191 @@ function App() {
     setQuickImportHtml('')
     setQuickImportMarkdown('')
     setNotice('已清空快速导入内容。')
+  }
+
+  const applySingleImageImportResult = useCallback(
+    (targetType: Exclude<QuestionType, 'choiceGroup'>, result: ParsedImageImportResponse) => {
+      const normalizedStem = normalizeMarkdownForEdit(result.stemMarkdown)
+      const normalizedOptions = result.options
+        .map((option) => normalizeMarkdownForEdit(option))
+        .filter((option) => option.trim().length > 0)
+        .slice(0, 8)
+
+      startTransition(() => {
+        setDraft((prev) => {
+          if (targetType === 'choice') {
+            const nextOptions =
+              normalizedOptions.length > 0
+                ? ensureLength(
+                    [
+                      ...normalizedOptions,
+                      ...Array.from({ length: Math.max(0, 8 - normalizedOptions.length) }, () => ''),
+                    ],
+                    8,
+                  ).slice(0, 8)
+                : prev.options
+
+            const nextOptionCount =
+              normalizedOptions.length >= 2
+                ? Math.min(8, Math.max(2, normalizedOptions.length))
+                : prev.optionCount
+
+            return {
+              ...prev,
+              stem: normalizedStem || prev.stem,
+              optionCount: nextOptionCount,
+              options: nextOptions,
+              choiceAnswers: sanitizeChoiceAnswers(prev.choiceMode, prev.choiceAnswers, nextOptionCount),
+            }
+          }
+
+          if (targetType === 'blank') {
+            const nextSlotCount = Math.max(1, detectInlineBlankCount(normalizedStem))
+            return {
+              ...prev,
+              stem: normalizedStem || prev.stem,
+              fillAnswers: ensureLength(prev.fillAnswers, nextSlotCount),
+            }
+          }
+
+          const nextSlotCount = Math.max(1, normalizeSubjectiveStem(normalizedStem).blankCount)
+          return {
+            ...prev,
+            stem: normalizedStem || prev.stem,
+            subjectiveAnswers: ensureLength(prev.subjectiveAnswers, nextSlotCount),
+          }
+        })
+      })
+    },
+    [normalizeMarkdownForEdit],
+  )
+
+  const submitSingleImageImport = async (file: File) => {
+    if (!aiConfigured) {
+      setNotice('请先在设置页同步云端 AI 配置。')
+      return
+    }
+
+    if (draft.type === 'choiceGroup') {
+      setNotice('快速图片导入仅支持单题，当前题型请改为选择题、填空题或主观题。')
+      return
+    }
+
+    const targetType = draft.type
+
+    const hasExistingContent =
+      draft.stem.trim().length > 0 ||
+      (targetType === 'choice' && draft.options.some((option) => option.trim().length > 0))
+
+    if (hasExistingContent) {
+      const confirmed = window.confirm('当前表单中已有题面内容。继续后会用识别结果覆盖题面，并尝试覆盖已识别出的选项，是否继续？')
+      if (!confirmed) {
+        return
+      }
+    }
+
+    setSingleImageImporting(true)
+
+    try {
+      const dataUrl = await readFileAsDataUrl(file)
+      const typeLabel =
+        targetType === 'choice' ? '选择题' : targetType === 'blank' ? '填空题' : '主观题'
+      const promptLines = [
+        `当前目标题型：${typeLabel}`,
+        '你是高中题面识别助手。请识别这张题目图片中的文字内容，并回填到当前单题表单。',
+        '不要创建题目，不要输出任何解释，只返回 JSON。',
+        '如果图片中存在配图、示意图、插图、图标或其他非文字内容，直接忽略，不要输出任何 Markdown 图片。',
+        '如果文字附近夹杂图片，只提取能读到的文字即可。',
+        '数学公式请尽量转成 LaTeX 或普通 Markdown 文本。',
+      ]
+
+      if (targetType === 'choice') {
+        promptLines.push(
+          '返回格式固定为 {"stem_markdown":"...","options":["..."]}。',
+          'stem_markdown 只保留题干本体，不要把选项再塞进题干。',
+          'options 只保留选项正文数组，不要包含 A. / B. / C. 之类前缀。',
+          '如果没有稳定识别出选项，options 返回空数组即可。',
+        )
+      } else {
+        promptLines.push(
+          '返回格式固定为 {"stem_markdown":"..."}。',
+          '只提取题面文字，不要生成答案、解析或补充说明。',
+          '如果题面中有空位，请尽量保留下划线、括号等原始形式；无法稳定表示时可使用 ▲。',
+        )
+      }
+
+      const response = await fetch(buildAIEndpoint(settings.baseUrl), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${settings.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: settings.model,
+          temperature: 0.1,
+          messages: [
+            {
+              role: 'system',
+              content: '你是严谨的 OCR 题面提取助手。你只负责提取文字并输出 JSON。',
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: promptLines.join('\n'),
+                },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: dataUrl,
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`AI 请求失败（HTTP ${response.status}）`)
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>
+      }
+      const content = data.choices?.[0]?.message?.content?.trim()
+      if (!content) {
+        throw new Error('AI 返回为空，请检查模型兼容性。')
+      }
+
+      const parsed = parseImageImportAiResponse(content)
+      if (!parsed?.stemMarkdown.trim()) {
+        throw new Error('未识别到可用题面文字，请换一张更清晰的图片后重试。')
+      }
+
+      if (draftTypeRef.current !== targetType) {
+        setNotice('识别结果已返回，但当前题型已切换，未自动回填，请重新导入。')
+        return
+      }
+
+      applySingleImageImportResult(targetType, parsed)
+
+      if (targetType === 'choice') {
+        setNotice(
+          parsed.options.length >= 2
+            ? '已识别图片内容并回填题面与选项，你可以继续补充答案、解析或图片。'
+            : '已识别题面，但未稳定识别出完整选项，请手动补充后再创建。',
+        )
+      } else {
+        setNotice('已识别图片内容并回填题面，你可以继续修改或补充图片。')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '快速图片导入失败'
+      setNotice(message)
+    } finally {
+      setSingleImageImporting(false)
+    }
   }
 
   const materializeQuickImportQuestion = useCallback(
@@ -4275,6 +4521,47 @@ function App() {
 
                 {createMode === 'manual' || isEditing ? (
                   <>
+                <section className="section-block single-image-import-block">
+                  <div className="section-headline">
+                    <div>
+                      <h3>快速图片导入</h3>
+                      <p className="hint">
+                        上传单张题目图片，AI 会先识别文字并回填当前表单；不会立即创建题目，后续仍可手动修改。
+                      </p>
+                    </div>
+                    <div className="section-actions">
+                      <button
+                        type="button"
+                        className="ghost-btn"
+                        disabled={singleImageImporting || draft.type === 'choiceGroup'}
+                        onClick={() => singleImageImportInputRef.current?.click()}
+                      >
+                        {singleImageImporting ? '识别中...' : '快速图片导入'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {draft.type === 'choiceGroup' ? (
+                    <p className="hint">当前为多空选择题。快速图片导入仅支持单题，请先切换到单题类型。</p>
+                  ) : (
+                    <p className="hint">如果图片中夹杂配图或小图，系统只提取文字，图片部分会忽略，后续可手动补回。</p>
+                  )}
+
+                  <input
+                    ref={singleImageImportInputRef}
+                    type="file"
+                    accept="image/*"
+                    hidden
+                    onChange={(event) => {
+                      const file = event.target.files?.[0]
+                      if (file) {
+                        void submitSingleImageImport(file)
+                      }
+                      event.currentTarget.value = ''
+                    }}
+                  />
+                </section>
+
                 <div className="type-picker">
                   <p>题目类型</p>
                   <div>
