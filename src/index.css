@@ -341,6 +341,54 @@ textarea {
   gap: 10px;
 }
 
+.rich-paste-surface {
+  border: 1px solid var(--line);
+  background: #fff;
+  padding: 12px 14px;
+  overflow: auto;
+  outline: none;
+  line-height: 1.65;
+  white-space: normal;
+}
+
+.rich-paste-surface:focus {
+  border-color: rgba(31, 75, 143, 0.45);
+  box-shadow: 0 0 0 3px rgba(31, 75, 143, 0.08);
+}
+
+.rich-paste-surface:empty::before {
+  content: attr(data-placeholder);
+  color: var(--ink-3);
+}
+
+.rich-paste-surface p,
+.rich-paste-surface ul,
+.rich-paste-surface ol,
+.rich-paste-surface blockquote,
+.rich-paste-surface table {
+  margin: 0 0 10px;
+}
+
+.rich-paste-surface img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 10px 0;
+  border-radius: 10px;
+}
+
+.rich-paste-surface table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.rich-paste-surface th,
+.rich-paste-surface td {
+  border: 1px solid var(--line);
+  padding: 6px 8px;
+  vertical-align: top;
+}
+
 .editor-preview {
   border: 1px solid var(--line);
   background: var(--surface);
@@ -1085,6 +1133,10 @@ textarea {
   }
 
   .editor-block.is-preview textarea {
+    display: none;
+  }
+
+  .editor-block.is-preview .rich-paste-surface {
     display: none;
   }
 

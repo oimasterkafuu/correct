@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import ExportConfigModal from './components/ExportConfigModal'
 import MarkdownEditor from './components/MarkdownEditor'
 import MarkdownRenderer from './components/MarkdownRenderer'
+import RichPasteEditor from './components/RichPasteEditor'
 import { SUBJECT_MAP, SUBJECTS } from './data/subjects'
 import {
   DEFAULT_PDF_EXPORT_SPACING_CONFIG,
@@ -46,6 +47,7 @@ type CreditFilter = 'all' | 'humanities' | 'science' | 'other'
 type TypeFilter = QuestionType | 'all'
 type AnalysisTarget = 'choice' | 'choiceGroup' | 'blank' | 'subjective'
 type PdfExportTarget = 'plain' | 'analysis'
+type CreateMode = 'manual' | 'quickImport'
 
 interface DraftState {
   subject: SubjectKey
@@ -76,6 +78,27 @@ interface ParsedChoiceGroupAiItem {
   generatedAnswers: string[]
   answerReasonable: boolean | null
   reasonabilityComment: string
+}
+
+interface QuickImportChoiceSubquestionPayload {
+  stemMarkdown: string
+  analysisMarkdown: string
+  choiceMode: ChoiceMode
+  optionStyle: OptionStyle
+  options: string[]
+  correctAnswers: string[]
+}
+
+interface QuickImportQuestionPayload {
+  type: QuestionType
+  stemMarkdown: string
+  analysisMarkdown: string
+  choiceMode: ChoiceMode
+  optionStyle: OptionStyle
+  options: string[]
+  correctAnswers: string[]
+  answers: string[]
+  subquestions: QuickImportChoiceSubquestionPayload[]
 }
 
 type ChatContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
@@ -1141,6 +1164,221 @@ function parseChoiceAnswerIndices(
   return [...result].sort((a, b) => a - b)
 }
 
+function normalizeChoiceModeValue(value: unknown, answerCount = 0): ChoiceMode {
+  const normalized =
+    value === 'single' || value === 'double' || value === 'multiple'
+      ? value
+      : typeof value === 'string'
+        ? value.toLowerCase().includes('double') || value.includes('双')
+          ? 'double'
+          : value.toLowerCase().includes('multiple') ||
+              value.toLowerCase().includes('multi') ||
+              value.includes('多') ||
+              value.includes('不定')
+            ? 'multiple'
+            : 'single'
+        : 'single'
+
+  if (answerCount <= 1) {
+    return 'single'
+  }
+  if (answerCount === 2) {
+    return normalized === 'multiple' ? 'multiple' : 'double'
+  }
+  return 'multiple'
+}
+
+function normalizeOptionStyleValue(value: unknown): OptionStyle {
+  if (value === 'circle' || value === 'latin') {
+    return value
+  }
+
+  if (typeof value === 'string' && (value.includes('①') || value.includes('circle') || value.includes('数字'))) {
+    return 'circle'
+  }
+
+  return 'latin'
+}
+
+function stripLeadingOptionMarker(value: string): string {
+  return value
+    .replace(/^\s*(?:[A-Ha-h][.)．、:：]|\d+[.)．、:：]|[①②③④⑤⑥⑦⑧⑨⑩][.)．、:：]?|\(\d+\))\s*/, '')
+    .trim()
+}
+
+function normalizeMarkdownImagePlaceholders(markdown: string): string[] {
+  const regex = new RegExp(MARKDOWN_IMAGE_REGEX.source, 'g')
+  return Array.from(markdown.matchAll(regex), (match) => match[0])
+}
+
+function buildQuickImportUserMessageContent(
+  prompt: string,
+  markdown: string,
+  imageMemory: Record<string, string>,
+): ChatMessageContent {
+  if (!markdown.includes('![') || !markdown.includes('(')) {
+    return `${prompt}${markdown}`
+  }
+
+  const imageRegex = new RegExp(MARKDOWN_IMAGE_REGEX.source, 'g')
+  const parts: ChatContentPart[] = []
+  pushTextPart(parts, prompt)
+  let cursor = 0
+
+  for (const match of markdown.matchAll(imageRegex)) {
+    const index = match.index ?? 0
+    const full = match[0]
+    const url = match[2] ?? ''
+
+    pushTextPart(parts, markdown.slice(cursor, index))
+    pushTextPart(parts, `${full}\n`)
+
+    const resolvedUrl = resolveImageUrlForAi(url, imageMemory)
+    if (resolvedUrl) {
+      parts.push({
+        type: 'image_url',
+        image_url: {
+          url: resolvedUrl,
+        },
+      })
+      pushTextPart(parts, '\n')
+    }
+
+    cursor = index + full.length
+  }
+
+  pushTextPart(parts, markdown.slice(cursor))
+  return parts
+}
+
+function parseQuickImportAiResponse(raw: string): QuickImportQuestionPayload[] | null {
+  const candidate = extractJsonCandidate(raw)
+  if (!candidate) {
+    return null
+  }
+
+  const json = parseJsonCandidate(candidate)
+  if (!json) {
+    return null
+  }
+
+  const rootItems = Array.isArray(json.questions)
+    ? json.questions
+    : Array.isArray(json.items)
+      ? json.items
+      : Array.isArray(json.data)
+        ? json.data
+        : null
+
+  if (!rootItems) {
+    return null
+  }
+
+  return rootItems
+    .map((item): QuickImportQuestionPayload | null => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+
+      const source = item as Record<string, unknown>
+      const rawType = String(source.type ?? source.question_type ?? source['题型'] ?? 'subjective')
+      const type: QuestionType =
+        rawType === 'choice' ||
+        rawType === 'choiceGroup' ||
+        rawType === 'blank' ||
+        rawType === 'subjective'
+          ? rawType
+          : rawType.includes('多空') || rawType.includes('组合')
+            ? 'choiceGroup'
+            : rawType.includes('选择')
+              ? 'choice'
+              : rawType.includes('填空')
+                ? 'blank'
+                : 'subjective'
+
+      const stemMarkdown = String(
+        source.stem_markdown ?? source.stem ?? source.question_markdown ?? source['题面'] ?? '',
+      ).trim()
+      const analysisMarkdown = String(
+        source.analysis_markdown ?? source.analysis ?? source['解析'] ?? '',
+      ).trim()
+      const options = normalizeToStringArray(source.options ?? source.option_markdown ?? source['选项']).map(
+        stripLeadingOptionMarker,
+      )
+      const correctAnswers =
+        type === 'choice' || type === 'choiceGroup'
+          ? normalizeToStringArray(
+              source.correct_answers ?? source.answer_keys ?? source.answers ?? source['答案'],
+            )
+          : []
+      const answers =
+        type === 'blank' || type === 'subjective'
+          ? normalizeToStringArray(
+              source.answers ??
+                source.answer_markdown ??
+                source.reference_answers ??
+                source['参考答案'] ??
+                source.blank_answers ??
+                source['答案'],
+            )
+          : normalizeToStringArray(
+              source.answer_markdown ?? source.reference_answers ?? source['参考答案'] ?? source.blank_answers,
+            )
+
+      const subquestionsSource = Array.isArray(source.subquestions)
+        ? source.subquestions
+        : Array.isArray(source.questions)
+          ? source.questions
+          : []
+
+      const subquestions = subquestionsSource
+        .map((subquestion): QuickImportChoiceSubquestionPayload | null => {
+          if (!subquestion || typeof subquestion !== 'object') {
+            return null
+          }
+
+          const subSource = subquestion as Record<string, unknown>
+          const subCorrectAnswers = normalizeToStringArray(
+            subSource.correct_answers ?? subSource.answers ?? subSource.answer_keys ?? subSource['答案'],
+          )
+
+          return {
+            stemMarkdown: String(
+              subSource.stem_markdown ?? subSource.stem ?? subSource.question_markdown ?? subSource['题面'] ?? '',
+            ).trim(),
+            analysisMarkdown: String(
+              subSource.analysis_markdown ?? subSource.analysis ?? subSource['解析'] ?? '',
+            ).trim(),
+            choiceMode: normalizeChoiceModeValue(
+              subSource.choice_mode ?? subSource.mode ?? subSource['子类型'],
+              subCorrectAnswers.length,
+            ),
+            optionStyle: normalizeOptionStyleValue(
+              subSource.option_style ?? subSource['选项风格'],
+            ),
+            options: normalizeToStringArray(subSource.options ?? subSource.option_markdown ?? subSource['选项']).map(
+              stripLeadingOptionMarker,
+            ),
+            correctAnswers: subCorrectAnswers,
+          }
+        })
+        .filter((subquestion): subquestion is QuickImportChoiceSubquestionPayload => subquestion !== null)
+
+      return {
+        type,
+        stemMarkdown,
+        analysisMarkdown,
+        choiceMode: normalizeChoiceModeValue(source.choice_mode ?? source.mode ?? source['子类型'], correctAnswers.length),
+        optionStyle: normalizeOptionStyleValue(source.option_style ?? source['选项风格']),
+        options,
+        correctAnswers,
+        answers,
+        subquestions,
+      }
+    })
+    .filter((item): item is QuickImportQuestionPayload => item !== null)
+}
+
 function buildChoiceDisplayMarkdown(question: Extract<Question, { type: 'choice' }>): string {
   const stemBase = migrateStemTokens(question.normalizedStem)
   const stemWithToken =
@@ -1596,6 +1834,10 @@ function App() {
     ...createInitialDraft(),
     subject: getLastCreatedSubject(),
   }))
+  const [createMode, setCreateMode] = useState<CreateMode>('manual')
+  const [quickImportHtml, setQuickImportHtml] = useState('')
+  const [quickImportMarkdown, setQuickImportMarkdown] = useState('')
+  const [quickImportSubmitting, setQuickImportSubmitting] = useState(false)
   const [notice, setNotice] = useState('')
   const [aiLoadingTarget, setAiLoadingTarget] = useState<AnalysisTarget | null>(null)
   const [pdfExporting, setPdfExporting] = useState(false)
@@ -2265,6 +2507,12 @@ function App() {
   }, [editPathQuestionId, editingQuestionId])
 
   useEffect(() => {
+    if (editPathQuestionId) {
+      setCreateMode('manual')
+    }
+  }, [editPathQuestionId])
+
+  useEffect(() => {
     if (!notice) {
       return undefined
     }
@@ -2532,6 +2780,281 @@ function App() {
       navigate('/create')
     }
     setNotice('已清空当前草稿。')
+  }
+
+  const clearQuickImportDraft = () => {
+    setQuickImportHtml('')
+    setQuickImportMarkdown('')
+    setNotice('已清空快速导入内容。')
+  }
+
+  const materializeQuickImportQuestion = useCallback(
+    (item: QuickImportQuestionPayload, subject: SubjectKey, timestamp: string): Question | null => {
+      if (item.type === 'choice') {
+        const stem = item.stemMarkdown.trim()
+        const options = item.options.map(stripLeadingOptionMarker).filter((option) => option.length > 0).slice(0, 8)
+        if (!stem || options.length < 2) {
+          return null
+        }
+
+        const optionStyle = normalizeOptionStyleValue(item.optionStyle)
+        const parsedAnswers = parseChoiceAnswerIndices(item.correctAnswers, options.length, optionStyle)
+        const choiceMode = normalizeChoiceModeValue(item.choiceMode, parsedAnswers.length)
+        const disableAutoSpacing = hasNoPanguMarker(stem)
+        const normalized = normalizeChoiceStem(stem)
+
+        return {
+          id: generateUuid(),
+          subject,
+          type: 'choice',
+          stem: materializeMarkdownForStorage(stem, { disableAutoSpacing }),
+          normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, { disableAutoSpacing }),
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          choiceMode,
+          optionStyle,
+          optionCount: options.length,
+          options: options.map((option) => materializeMarkdownForStorage(option, { disableAutoSpacing })),
+          correctAnswers: sanitizeChoiceAnswers(choiceMode, parsedAnswers, options.length),
+          analysis: materializeMarkdownForStorage(item.analysisMarkdown.trim(), { disableAutoSpacing }),
+        }
+      }
+
+      if (item.type === 'choiceGroup') {
+        const groupStem = item.stemMarkdown.trim()
+        const groupDisableAutoSpacing = hasNoPanguMarker(groupStem)
+        const subquestions = item.subquestions
+          .map((subquestion) => {
+            const stem = subquestion.stemMarkdown.trim()
+            const options = subquestion.options
+              .map(stripLeadingOptionMarker)
+              .filter((option) => option.length > 0)
+              .slice(0, 8)
+
+            if (!stem || options.length < 2) {
+              return null
+            }
+
+            const optionStyle = normalizeOptionStyleValue(subquestion.optionStyle)
+            const parsedAnswers = parseChoiceAnswerIndices(
+              subquestion.correctAnswers,
+              options.length,
+              optionStyle,
+            )
+            const choiceMode = normalizeChoiceModeValue(subquestion.choiceMode, parsedAnswers.length)
+            const disableAutoSpacing = groupDisableAutoSpacing || hasNoPanguMarker(stem)
+            const normalized = normalizeChoiceStem(stem)
+
+            return {
+              id: generateUuid(),
+              stem: materializeMarkdownForStorage(stem, { disableAutoSpacing }),
+              normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, {
+                disableAutoSpacing,
+              }),
+              choiceMode,
+              optionStyle,
+              optionCount: options.length,
+              options: options.map((option) =>
+                materializeMarkdownForStorage(option, {
+                  disableAutoSpacing,
+                }),
+              ),
+              correctAnswers: sanitizeChoiceAnswers(choiceMode, parsedAnswers, options.length),
+              analysis: materializeMarkdownForStorage(subquestion.analysisMarkdown.trim(), {
+                disableAutoSpacing,
+              }),
+            }
+          })
+          .filter((subquestion): subquestion is ChoiceSubQuestion => subquestion !== null)
+
+        if (subquestions.length === 0) {
+          return null
+        }
+
+        return {
+          id: generateUuid(),
+          subject,
+          type: 'choiceGroup',
+          stem: materializeMarkdownForStorage(groupStem, {
+            disableAutoSpacing: groupDisableAutoSpacing,
+          }),
+          normalizedStem: materializeMarkdownForStorage(groupStem, {
+            disableAutoSpacing: groupDisableAutoSpacing,
+          }),
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          subquestions,
+        }
+      }
+
+      if (item.type === 'blank') {
+        const stem = item.stemMarkdown.trim()
+        if (!stem) {
+          return null
+        }
+
+        const disableAutoSpacing = hasNoPanguMarker(stem)
+        const normalized = normalizeBlankStem(stem)
+        const answers = ensureLength(item.answers.map((answer) => answer.trim()), normalized.blankCount)
+          .slice(0, normalized.blankCount)
+
+        return {
+          id: generateUuid(),
+          subject,
+          type: 'blank',
+          stem: materializeMarkdownForStorage(stem, { disableAutoSpacing }),
+          normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, { disableAutoSpacing }),
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          blankCount: normalized.blankCount,
+          answers: answers.map((answer) => materializeMarkdownForStorage(answer, { disableAutoSpacing })),
+          analysis: materializeMarkdownForStorage(item.analysisMarkdown.trim(), { disableAutoSpacing }),
+        }
+      }
+
+      const stem = item.stemMarkdown.trim()
+      if (!stem) {
+        return null
+      }
+
+      const disableAutoSpacing = hasNoPanguMarker(stem)
+      const normalized = normalizeSubjectiveStem(stem)
+      const answerCount = Math.max(1, normalized.blankCount)
+      const answers = ensureLength(item.answers.map((answer) => answer.trim()), answerCount)
+        .slice(0, answerCount)
+
+      return {
+        id: generateUuid(),
+        subject,
+        type: 'subjective',
+        stem: materializeMarkdownForStorage(stem, { disableAutoSpacing }),
+        normalizedStem: materializeMarkdownForStorage(normalized.normalizedStem, { disableAutoSpacing }),
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        areaCount: normalized.blankCount,
+        answers: answers.map((answer) => materializeMarkdownForStorage(answer, { disableAutoSpacing })),
+        analysis: materializeMarkdownForStorage(item.analysisMarkdown.trim(), { disableAutoSpacing }),
+      }
+    },
+    [materializeMarkdownForStorage],
+  )
+
+  const submitQuickImport = async () => {
+    if (!aiConfigured) {
+      setNotice('请先在设置页同步云端 AI 配置。')
+      return
+    }
+
+    const sourceMarkdown = quickImportMarkdown.trim()
+    if (!sourceMarkdown) {
+      setNotice('请先粘贴需要快速导入的内容。')
+      return
+    }
+
+    const subjectLabel = SUBJECT_MAP[draft.subject].label
+    const endpoint = buildAIEndpoint(settings.baseUrl)
+    const imagePlaceholders = normalizeMarkdownImagePlaceholders(sourceMarkdown)
+
+    const instructionLines = [
+      `学科固定为：${subjectLabel}`,
+      '你是高中题目录入助手。你的任务是把用户粘贴的一整段 Markdown 内容切分为 1 道或多道标准题目。',
+      '必须识别题目边界，并为每道题选择最合适的 type：choice、choiceGroup、blank、subjective。',
+      '若原文缺少答案或解析，需要结合题面自动补全，确保最终题目可以直接入库。',
+      '若原文包含图片占位符，输出时必须原样保留对应的 Markdown 图片语法，不能改名、不能丢失、不能新增不存在的图片。',
+      '表格尽量保留为 Markdown 表格；数学公式保持 Markdown/LaTeX。',
+      '输出必须是 JSON（可放在 ```json 代码块中），根对象格式固定为：',
+      '{"questions":[{"type":"choice","stem_markdown":"...","analysis_markdown":"...","choice_mode":"single","option_style":"latin","options":["..."],"correct_answers":["A"]}]}',
+      '各字段要求如下：',
+      '1. type 只能是 choice、choiceGroup、blank、subjective。',
+      '2. stem_markdown 是题面 Markdown；choiceGroup 的 stem_markdown 是共享材料，可为空。',
+      '3. analysis_markdown 是该题解析，使用 Markdown，但不要使用任何标题。',
+      '4. choice/choiceGroup 的 options 必须是纯选项内容数组，不要再带 A. / B. 前缀。',
+      '5. choice/choiceGroup 的 correct_answers 使用数组，内容为 A/B/C/①/②/1 等可识别选项标记。',
+      '6. blank/subjective 使用 answers 数组。',
+      '7. choiceGroup 使用 subquestions 数组，每个子题格式为 {"stem_markdown":"...","analysis_markdown":"...","choice_mode":"single","option_style":"latin","options":["..."],"correct_answers":["A"]}。',
+      '8. 除 JSON 外不要输出任何额外说明。',
+    ]
+
+    if (imagePlaceholders.length > 0) {
+      instructionLines.push(`当前可用图片占位符：${imagePlaceholders.join('、')}`)
+    }
+
+    const prompt = `${instructionLines.join('\n')}\n\n以下是待切题的原始 Markdown 内容：\n\n`
+    const userMessageContent = buildQuickImportUserMessageContent(
+      prompt,
+      sourceMarkdown,
+      imageMemoryRef.current,
+    )
+
+    setQuickImportSubmitting(true)
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${settings.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: settings.model,
+          temperature: 0.1,
+          messages: [
+            {
+              role: 'system',
+              content:
+                '你是严谨的高中题目录入助手。你必须稳定输出 JSON，并严格保留题面里的图片占位符与 Markdown 结构。',
+            },
+            {
+              role: 'user',
+              content: userMessageContent,
+            },
+          ],
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`AI 请求失败（HTTP ${response.status}）`)
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>
+      }
+      const content = data.choices?.[0]?.message?.content?.trim()
+      if (!content) {
+        throw new Error('AI 返回为空，请检查模型兼容性。')
+      }
+
+      const parsedItems = parseQuickImportAiResponse(content)
+      if (!parsedItems || parsedItems.length === 0) {
+        throw new Error('AI 返回格式不完整，未识别到可导入的题目数组。')
+      }
+
+      const timestamp = new Date().toISOString()
+      const createdQuestions = parsedItems
+        .map((item) => materializeQuickImportQuestion(item, draft.subject, timestamp))
+        .filter((item): item is Question => item !== null)
+
+      if (createdQuestions.length === 0) {
+        throw new Error('AI 已返回结果，但没有成功生成可入库的题目，请检查粘贴内容后重试。')
+      }
+
+      updateQuestions((prev) => [...createdQuestions, ...prev])
+      toLocalStorage(LAST_CREATED_SUBJECT_KEY, draft.subject)
+      setQuickImportHtml('')
+      setQuickImportMarkdown('')
+
+      const skippedCount = parsedItems.length - createdQuestions.length
+      if (skippedCount > 0) {
+        setNotice(`已批量创建 ${createdQuestions.length} 道题目，另有 ${skippedCount} 道未能入库。`)
+      } else {
+        setNotice(`已批量创建 ${createdQuestions.length} 道题目。`)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '快速导入失败'
+      setNotice(message)
+    } finally {
+      setQuickImportSubmitting(false)
+    }
   }
 
   const startEditQuestion = (question: Question) => {
@@ -3728,6 +4251,30 @@ function App() {
               ) : null}
 
               <section className="quick-form">
+                {!isEditing ? (
+                  <div className="type-picker create-mode-picker">
+                    <p>创建方式</p>
+                    <div>
+                      <button
+                        type="button"
+                        className={createMode === 'manual' ? 'active' : ''}
+                        onClick={() => setCreateMode('manual')}
+                      >
+                        普通创建
+                      </button>
+                      <button
+                        type="button"
+                        className={createMode === 'quickImport' ? 'active' : ''}
+                        onClick={() => setCreateMode('quickImport')}
+                      >
+                        快速导入
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {createMode === 'manual' || isEditing ? (
+                  <>
                 <div className="type-picker">
                   <p>题目类型</p>
                   <div>
@@ -4215,6 +4762,80 @@ function App() {
                     {isEditing ? '取消编辑' : '放弃当前创建'}
                   </button>
                 </div>
+                  </>
+                ) : (
+                  <>
+                    <section className="section-block quick-import-block">
+                      <div className="section-headline">
+                        <div>
+                          <h3>快速导入题目</h3>
+                          <p className="hint">
+                            直接粘贴 Word、网页、表格、图片或多道题混合内容；系统会先转成 Markdown，再交给 AI 批量切题。
+                          </p>
+                        </div>
+                      </div>
+
+                      <RichPasteEditor
+                        label="导入内容"
+                        htmlValue={quickImportHtml}
+                        markdownValue={quickImportMarkdown}
+                        onHtmlChange={setQuickImportHtml}
+                        onMarkdownChange={setQuickImportMarkdown}
+                        onResolveImageDataUrl={rememberImageInMemory}
+                        resolveMarkdownForPreview={resolveMarkdownForPreview}
+                        minHeight={280}
+                        placeholder="把任意格式的题目内容直接粘贴到这里。支持一次性粘贴多道题、表格和图片。"
+                      />
+
+                      <p className="hint">
+                        内部会自动生成 Markdown 并保留图片占位符；点击创建后，AI 会完成切题、识别题型并批量入库。
+                      </p>
+                    </section>
+
+                    <section className="subject-picker">
+                      <p>最后确认学科</p>
+                      <div className="subject-list">
+                        {SUBJECTS.map((subject) => (
+                          <button
+                            key={subject.key}
+                            type="button"
+                            className={draft.subject === subject.key ? 'active' : ''}
+                            style={
+                              {
+                                '--subject-color': subject.color,
+                                '--subject-soft-color': subject.softColor,
+                              } as CSSProperties
+                            }
+                            onClick={() => updateDraft('subject', subject.key)}
+                          >
+                            {subject.label}
+                          </button>
+                        ))}
+                      </div>
+                    </section>
+
+                    <div className="bottom-actions">
+                      <button
+                        type="button"
+                        className="primary-btn"
+                        disabled={quickImportSubmitting}
+                        onClick={() => {
+                          void submitQuickImport()
+                        }}
+                      >
+                        {quickImportSubmitting ? '创建中...' : '批量创建题目'}
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-btn"
+                        disabled={quickImportSubmitting}
+                        onClick={clearQuickImportDraft}
+                      >
+                        清空导入内容
+                      </button>
+                    </div>
+                  </>
+                )}
               </section>
             </section>
           ) : null}
